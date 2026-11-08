@@ -1,0 +1,9 @@
+This project is derived from squaremap (https://github.com/jpenilla/squaremap), MIT licence.
+
+Copyright notices of the original work (from squaremap's LICENSE, commit 2e158c2):
+
+    Copyright (c) 2021-2024 Jason Penilla and Contributors
+    Copyright (c) 2020-2021 William Blake Galbreath & Contributors
+
+The licence text is in LICENSE. The web frontend in mixins/squaremap/core/web/ is squaremap's
+built frontend; it bundles Leaflet (BSD 2-Clause), see LICENSE.
