@@ -7,3 +7,5 @@ Copyright notices of the original work (from squaremap's LICENSE, commit 2e158c2
 
 The licence text is in LICENSE. The web frontend in mixins/squaremap/core/web/ is squaremap's
 built frontend; it bundles Leaflet (BSD 2-Clause), see LICENSE.
+
+Minecraft textures and other game assets in the bundled web frontend belong to Mojang AB / Microsoft. This project is not affiliated with or endorsed by Mojang or Microsoft.
