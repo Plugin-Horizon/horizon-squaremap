@@ -2,7 +2,7 @@ id = "squaremap"
 name = "squaremap"
 version = "0.3.0"
 description = "Web map for Horizon: tiles of the overworld, nether and end in squaremap's format, served from 127.0.0.1."
-authors = ["CoreSMP"]
+authors = ["Plugin-Horizon contributors"]
 api = "0.2"
 capabilities = ["registries"]
 
