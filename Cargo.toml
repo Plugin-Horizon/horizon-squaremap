@@ -1,0 +1,10 @@
+[package]
+name = "mod-squaremap"
+version = "0.3.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+# The launcher (or stage.py) points this at the Horizon source the game is built from.
+horizon-mod-api = { git = "https://github.com/arismoko/horizon" }
+horizon-squaremap = { path = "core" }
