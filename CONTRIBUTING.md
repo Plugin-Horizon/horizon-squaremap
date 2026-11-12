@@ -6,10 +6,10 @@ Pull requests and improvements are always welcome! Bug reports, ideas and docume
 
 The core crate(s) are plain Rust and build without the Horizon engine, so you only need a stable Rust toolchain:
 
-- `mixins/squaremap/core`
+- `core`
 
 ```sh
-(cd mixins/squaremap/core && cargo test)
+(cd core && cargo test)
 ```
 
 CI runs exactly these commands (job name `test`) on every push and pull request. Parts of the repository that depend on the Horizon engine are not built by CI; if you change them, please say in the PR how you tested the change.
