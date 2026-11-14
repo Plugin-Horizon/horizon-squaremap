@@ -16,6 +16,7 @@ pub mod render;
 pub mod runtime;
 pub mod scan;
 pub mod tables;
+pub mod vanilla;
 pub mod visibility;
 pub mod web;
 

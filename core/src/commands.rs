@@ -57,15 +57,16 @@ pub fn usages() -> Vec<(String, u8)> {
     for l in labels.iter().filter(|l| !l.is_empty() && !l.contains(char::is_whitespace)) {
         out.push((l.clone(), 0));
         out.push((format!("{l} confirm"), 0));
-        // `word?` asks the server for completions of the world names (`world_completions`).
+        // World names are `minecraft:<name>` keys, which a `word` argument refuses (no colon); a world that
+        // comes last is `text` instead. `radiusrender` has the world first, so it stays `word?` (`overworld`, `the_nether`).
         for u in [
             "help [query:text]",
-            "fullrender [world:word?]",
+            "fullrender [world:text]",
             "radiusrender <world:word?> <radius:integer>",
             "radiusrender <world:word?> <radius:integer> <x:word> <z:word>",
-            "cancelrender [world:word?]",
-            "pauserender [world:word?]",
-            "resetmap <world:word?>",
+            "cancelrender [world:text]",
+            "pauserender [world:text]",
+            "resetmap <world:text>",
             "progresslogging",
             "progresslogging toggle",
             "progresslogging rate <seconds:integer>",
@@ -514,7 +515,14 @@ fn hide_show(hide: bool, target: Option<&str>, sender: &Sender, online: &[(u128,
 
 /// `LinkCommand`: the web address, with `?uuid=` of a player sender.
 fn link(sender: &Sender) -> Line {
-    let mut link = runtime::config().settings.web_address;
+    let config = runtime::config();
+    let mut link = config.settings.web_address;
+    // The stock address (`http://localhost:8080`) is only a placeholder: when the internal web server
+    // listens elsewhere, the link points at it, so `/map link` is usable out of the box.
+    let server = &config.settings.internal_webserver;
+    if link == "http://localhost:8080" && server.enabled && server.port != 8080 {
+        link = format!("http://{}:{}", server.bind, server.port);
+    }
     if let Some(p) = &sender.player {
         link.push(if link.contains('?') { '&' } else { '?' });
         link.push_str(&format!("uuid={:032x}", p.uuid));
@@ -587,7 +595,7 @@ mod tests {
         let u = usages();
         assert!(u.contains(&("squaremap".into(), 0)));
         assert!(u.contains(&("map confirm".into(), 0)));
-        assert!(u.contains(&("map fullrender [world:word?]".into(), OP_LEVEL)));
+        assert!(u.contains(&("map fullrender [world:text]".into(), OP_LEVEL)));
         assert!(is_ours("map hide") && is_ours("/SquareMap") && !is_ours("maps"));
     }
 

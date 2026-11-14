@@ -11,8 +11,9 @@
 //! `serverconfig/squaremap-server.toml` wins). The web server binds 127.0.0.1 by default.
 use horizon_squaremap as sm;
 use mod_api::{
-    BlockChangedEvent, ChunkLoadEvent, ChunkUnloadEvent, Command, CommandArgumentValue, CommandSource,
-    Config, ConfigKind, ConfigLoadingEvent, ConfigReloadingEvent, Flow, HostSide, Hooks, LivingRef,
+    BlockChangedEvent, BlockMetadata, ChunkLoadEvent, ChunkUnloadEvent, Command, CommandArgumentValue, CommandSource,
+    HostBlockStates,
+    Config, ConfigKind, ConfigLoadingEvent, ConfigReloadingEvent, Flow, HostSide, Hooks, LivingRef, PlayerCommandEvent,
     RegisterCommandsEvent, RegisterConfigsEvent, RunModCommandEvent, ServerHost, ServerStartedEvent,
     ServerStoppingEvent, ServerTickEvent, ServerTickPhase, Suggestion, TabCompleteEvent, Text,
 };
@@ -50,19 +51,82 @@ fn max_players(host: &dyn ServerHost) -> usize {
         .unwrap_or(20)
 }
 
-/// The block-state table, biome table, zoom and swamp-grass readers the core starts with. The
-/// game's glue builds them from the registries and the biome zoom (glue.rs `world_phase`); arismoko
-/// has no way to list them yet, so the map does not start.
-// TODO(arismoko-api: block_state_table): every block state with its name, properties, `age`,
-//   map colour as RGB (`block_state_map_color` answers only the map colour id) and fluid. Needs
-//   a registry listing; the per-state reads exist, a listing does not.
-// TODO(arismoko-api: biome_table): every biome id with name, temperature, downfall, the grass,
-//   foliage, dry-foliage and water tints and the grass modifier. `level_biome_in_tag` answers
-//   only one biome against one tag.
+/// The game's resource folder: the engine's `--resources <dir>` argument (or `HORIZON_RESOURCES`).
+fn resources_dir() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("HORIZON_RESOURCES") {
+        return Some(PathBuf::from(p));
+    }
+    let raw = std::fs::read("/proc/self/cmdline").ok()?;
+    let args: Vec<String> = raw.split(|b| *b == 0).map(|a| String::from_utf8_lossy(a).into_owned()).collect();
+    args.iter()
+        .enumerate()
+        .find_map(|(i, a)| match a.strip_prefix("--resources=") {
+            Some(v) => Some(v.to_owned()),
+            None => (a.as_str() == "--resources").then(|| args.get(i + 1).cloned()).flatten(),
+        })
+        .map(PathBuf::from)
+}
+
+/// The block-state table, biome table and world env the core starts with. arismoko has no registry
+/// listing, so the block ids come from the resource folder's `registries.json` and the biomes from its
+/// worldgen files (`sm::vanilla`); the host answers each block's states and their map colours.
+/// Cause of "not started" before this: the function returned None unconditionally, so `server_started`
+/// never reached `sm::start` (no hook, level-name or capability problem).
 // TODO(arismoko-api: biome_zoom): the biome zoom (`quart_at_block`) and the swamp grass noise the
-//   core uses for chunks it reads from the region files (full and radius renders).
-fn render_tables() -> Option<(Vec<sm::RawState>, Vec<sm::RawBiome>, sm::WorldEnv)> {
-    None
+//   core uses for chunks it reads from the region files: `WorldEnv::plain()` (unfuzzed quart cell,
+//   flat swamp grass) stands in.
+fn render_tables(host: &dyn ServerHost) -> Option<(Vec<sm::RawState>, Vec<sm::RawBiome>, sm::WorldEnv)> {
+    let dir = resources_dir()?;
+    let mut states = Vec::new();
+    // The public host path (`block_key`, `block_states_of` and `block_state_map_color` only exist on the
+    // hidden backend, arismoko/horizon#3927): every key by its registered name, then the metadata view.
+    let meta = host.block_states();
+    let keys: std::collections::HashMap<String, _> = host
+        .block_keys()
+        .into_iter()
+        .filter_map(|key| meta.name(key).ok().map(|n| (n.to_owned(), key)))
+        .collect();
+    for name in sm::vanilla::block_names(&dir) {
+        let Some(&key) = keys.get(&name).or_else(|| keys.get(&format!("minecraft:{name}"))) else { continue };
+        let Some(range) = meta.states_of(key) else { continue };
+        let default_map_color = host
+            .block_state_default(key)
+            .and_then(|s| meta.map_color(s))
+            .unwrap_or(0);
+        for state in range.iter() {
+            let Some(text) = host.block_state_string(state) else { continue };
+            let (block, properties) = sm::vanilla::parse_state(&text);
+            let prop = |k: &str| properties.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+            let age = prop("age").and_then(|v| v.parse::<u8>().ok());
+            let fluid = if block == "minecraft:lava" {
+                sm::Fluid::Lava
+            } else if block == "minecraft:water"
+                || prop("waterlogged") == Some("true")
+                || matches!(
+                    block.as_str(),
+                    "minecraft:bubble_column" | "minecraft:kelp" | "minecraft:kelp_plant" | "minecraft:seagrass" | "minecraft:tall_seagrass"
+                )
+            {
+                sm::Fluid::Water
+            } else {
+                sm::Fluid::None
+            };
+            states.push(sm::RawState {
+                name: block,
+                properties,
+                age,
+                map_color: meta.map_color(state).unwrap_or(0),
+                default_map_color,
+                map_rgb: None,
+                fluid,
+            });
+        }
+    }
+    let biomes = sm::vanilla::biomes(&dir);
+    if states.is_empty() || biomes.is_empty() {
+        return None;
+    }
+    Some((states, biomes, sm::WorldEnv::plain()))
 }
 
 /// The border of a dimension's level, when it is loaded.
@@ -184,15 +248,15 @@ impl Hooks for Mod {
         }
     }
 
-    fn server_started(&self, _: &mut dyn ServerHost, _: &mut ServerStartedEvent) {
-        match render_tables() {
+    fn server_started(&self, host: &mut dyn ServerHost, _: &mut ServerStartedEvent) {
+        match render_tables(&*host) {
             Some((states, biomes, env)) => match sm::start(&level_dir(), states, biomes, env) {
                 Ok(()) => log("map started"),
                 Err(e) => log(&format!("not started: {e}")),
             },
             None => log(
-                "not started: block-state and biome tables are not readable on arismoko yet \
-                 (TODO(arismoko-api: block_state_table), see PORT_NOTES.md)",
+                "not started: block-state or biome tables could not be built (resource folder with \
+                 registries.json and data/minecraft/worldgen/biome not found, or the host lists no states)",
             ),
         }
     }
@@ -254,6 +318,22 @@ impl Hooks for Mod {
                 None => command,
             });
         }
+    }
+
+    fn player_command(&self, host: &mut dyn ServerHost, event: &mut PlayerCommandEvent<'_>) -> Flow {
+        // A player without the sub-command's node (`squaremap.command.<sub>`, operators by default) gets
+        // squaremap's no-permission line instead of the engine's "Unknown command".
+        if !sm::commands::is_ours(event.command) {
+            return Flow::Continue;
+        }
+        let Some(node) = sm::commands::permission_node(event.command) else { return Flow::Continue };
+        let allowed = host.player(event.player).is_some_and(|p| p.has_permission(&*host, &node));
+        if allowed {
+            return Flow::Continue;
+        }
+        event.replies.push(Text::literal("\u{a7}cI'm sorry, but you do not have permission to perform this command. Please contact the server administrators if you believe that this is in error."));
+        event.cancelled = true;
+        Flow::Cancel
     }
 
     fn run_mod_command(&self, host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>) -> Flow {
