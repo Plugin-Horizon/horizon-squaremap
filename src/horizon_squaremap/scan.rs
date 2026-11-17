@@ -1,8 +1,8 @@
 //! A chunk's 16x16 map pixels: squaremap's `ChunkScanner` and `BiomeColorSampler`
 //! (MIT, Copyright (c) 2021-2024 Jason Penilla), over a read-only view of the level.
-use crate::color::{self, Blender};
-use crate::config::MapConfig;
-use crate::tables::{Fluid, GrassModifier, StateInfo, Tables, Tint, AIR, BASE, GLASS, INVISIBLE, PLAIN_GLASS};
+use crate::horizon_squaremap::color::{self, Blender};
+use crate::horizon_squaremap::config::MapConfig;
+use crate::horizon_squaremap::tables::{Fluid, GrassModifier, StateInfo, Tables, Tint, AIR, BASE, GLASS, INVISIBLE, PLAIN_GLASS};
 
 /// A pixel no scan wrote (`Integer.MIN_VALUE` in squaremap).
 pub const UNSET: u32 = 0x8000_0000;
@@ -364,8 +364,8 @@ impl Scanner<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Config, DEFAULT_TOML};
-    use crate::tables::{RawBiome, RawState};
+    use crate::horizon_squaremap::config::{Config, DEFAULT_TOML};
+    use crate::horizon_squaremap::tables::{RawBiome, RawState};
 
     /// A flat test level: per column a list of (y, state) from the bottom, one biome.
     struct Flat {

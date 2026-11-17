@@ -2,9 +2,9 @@
 //! saved but not loaded: squaremap's full and radius renders read unloaded chunks from disk
 //! the same way (`ChunkMap.read`). Only what the scanner needs is decoded: block states,
 //! biomes and the `WORLD_SURFACE` heightmap.
-use crate::nbt::{self, Tag};
-use crate::scan::ChunkView;
-use crate::tables::RawState;
+use crate::horizon_squaremap::nbt::{self, Tag};
+use crate::horizon_squaremap::scan::ChunkView;
+use crate::horizon_squaremap::tables::RawState;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
@@ -542,8 +542,8 @@ impl ChunkView for DiskView {
 /// Writers for tests: a chunk's NBT and a region file holding chunks.
 #[cfg(test)]
 pub mod testdata {
-    use crate::nbt::write::{compound, root};
-    use crate::nbt::Tag;
+    use crate::horizon_squaremap::nbt::write::{compound, root};
+    use crate::horizon_squaremap::nbt::Tag;
 
     /// Packs `values` with `bits` each, none spanning two longs.
     pub fn pack(values: &[u64], bits: u32) -> Vec<i64> {
@@ -694,9 +694,9 @@ mod tests {
     fn unknown_properties_fall_back_to_the_block_and_unknown_blocks_to_air() {
         let i = ids();
         let e = |n: &str, p: &[(&str, &str)]| {
-            crate::nbt::write::compound(vec![
+            crate::horizon_squaremap::nbt::write::compound(vec![
                 ("Name", Tag::String(n.into())),
-                ("Properties", crate::nbt::write::compound(p.iter().map(|(k, v)| (*k, Tag::String((*v).into()))).collect())),
+                ("Properties", crate::horizon_squaremap::nbt::write::compound(p.iter().map(|(k, v)| (*k, Tag::String((*v).into()))).collect())),
             ])
         };
         assert_eq!(i.state(&e("minecraft:oak_log", &[("axis", "x")])), 2);
@@ -704,7 +704,7 @@ mod tests {
         assert_eq!(i.state(&e("minecraft:water", &[("level", "0")])), 4);
         assert_eq!(i.state(&e("modded:thing", &[])), u32::MAX);
         // 26.x: plain names, {id, properties}, and both wrapped in a mixed list.
-        let c = crate::nbt::write::compound;
+        let c = crate::horizon_squaremap::nbt::write::compound;
         assert_eq!(i.state(&Tag::String("minecraft:stone".into())), 1);
         let new = c(vec![("id", Tag::String("minecraft:oak_log".into())), ("properties", c(vec![("axis", Tag::String("y".into()))]))]);
         assert_eq!(i.state(&new), 3);

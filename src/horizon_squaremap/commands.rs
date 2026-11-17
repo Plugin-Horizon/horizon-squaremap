@@ -2,9 +2,9 @@
 //! nodes, English messages, colours, hovers and clicks (`Messages`; MIT, Copyright (c) 2021-2024
 //! Jason Penilla and Contributors). The game side hands over the line and who sent it, and sends
 //! the returned lines back (`glue.rs`).
-use crate::json::WORLDS;
-use crate::render::{Mode, PROGRESS_INTERVAL, PROGRESS_LOGGING};
-use crate::runtime::{self, RenderRefused};
+use crate::horizon_squaremap::json::WORLDS;
+use crate::horizon_squaremap::render::{Mode, PROGRESS_INTERVAL, PROGRESS_LOGGING};
+use crate::horizon_squaremap::runtime::{self, RenderRefused};
 use std::sync::atomic::Ordering;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -498,16 +498,16 @@ fn hide_show(hide: bool, target: Option<&str>, sender: &Sender, online: &[(u128,
             Some(n) => invalid_argument(format!("No player named '{n}' is online")),
         }];
     };
-    let hidden = crate::api::player_hidden(uuid);
+    let hidden = crate::horizon_squaremap::api::player_hidden(uuid);
     match (hide, hidden) {
         (true, true) => vec![msg(format!("{name} is already hidden from map"), RED)],
         (true, false) => {
-            crate::api::hide_player(uuid, true);
+            crate::horizon_squaremap::api::hide_player(uuid, true);
             vec![msg(format!("{name} is now hidden from map"), GREEN)]
         }
         (false, false) => vec![msg(format!("{name} is not hidden from map"), RED)],
         (false, true) => {
-            crate::api::show_player(uuid, true);
+            crate::horizon_squaremap::api::show_player(uuid, true);
             vec![msg(format!("{name} is no longer hidden from map"), GREEN)]
         }
     }

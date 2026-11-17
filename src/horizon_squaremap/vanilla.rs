@@ -2,7 +2,7 @@
 //! the engine was started with: `--resources <dir>`). arismoko has no registry listing, so the
 //! names come from `registries.json` and `data/minecraft/worldgen/biome/*.json`; the host then
 //! answers each block's states and map colours (see the glue in `src/lib.rs`).
-use crate::tables::{GrassModifier, RawBiome};
+use crate::horizon_squaremap::tables::{GrassModifier, RawBiome};
 use std::path::Path;
 
 /// Every block id (`minecraft:stone`), sorted, from `registries.json` (`minecraft:block`).
@@ -41,8 +41,8 @@ fn colour(v: &serde_json::Value) -> Option<u32> {
 
 /// `GrassColor.get` / `FoliageColor.get` on one of the shipped colormaps.
 fn colormap(file: &str, temperature: f32, downfall: f32) -> Option<u32> {
-    let bytes = crate::assets::file(file)?;
-    let (_, _, px) = crate::image::decode_rgb(bytes).ok()?;
+    let bytes = crate::horizon_squaremap::assets::file(file)?;
+    let (_, _, px) = crate::horizon_squaremap::image::decode_rgb(bytes).ok()?;
     let t = f64::from(temperature.clamp(0.0, 1.0));
     let h = f64::from(downfall.clamp(0.0, 1.0)) * t;
     let i = ((1.0 - t) * 255.0) as usize;

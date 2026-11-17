@@ -2,8 +2,8 @@
 //! game's registries (handed over as [`RawState`]/[`RawBiome`]) and the world's config.
 //! The colour rules are squaremap's `BlockColors`, `BiomeColorTables` and
 //! `BiomeColorSampler` (MIT, Copyright (c) 2021-2024 Jason Penilla).
-use crate::color::{self, WATER_MAP_COLOR};
-use crate::config::WorldConfig;
+use crate::horizon_squaremap::color::{self, WATER_MAP_COLOR};
+use crate::horizon_squaremap::config::WorldConfig;
 use std::sync::OnceLock;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -202,7 +202,7 @@ impl Tables {
 
 /// The modifier the scanner still has to apply to a biome whose grass colour came from the
 /// game's tint: that tint already holds the dark forest's step, and a swamp's grass is
-/// per column (read from the snapshot's [`crate::scan::SwampGrid`] or the world env).
+/// per column (read from the snapshot's [`crate::horizon_squaremap::scan::SwampGrid`] or the world env).
 pub fn grass_modifier_after_tint(game: GrassModifier) -> GrassModifier {
     match game {
         GrassModifier::Swamp => GrassModifier::Swamp,
@@ -228,7 +228,7 @@ fn dynamic_color(name: &str, age: Option<u8>) -> Option<u32> {
 fn colormap_foliage(temperature: f32, downfall: f32) -> Option<u32> {
     static MAP: OnceLock<Vec<u32>> = OnceLock::new();
     let map = MAP.get_or_init(|| {
-        crate::image::decode_rgb(crate::assets::file("images/foliage.png").unwrap_or_default())
+        crate::horizon_squaremap::image::decode_rgb(crate::horizon_squaremap::assets::file("images/foliage.png").unwrap_or_default())
             .map(|(_, _, px)| px)
             .unwrap_or_default()
     });
@@ -242,7 +242,7 @@ fn colormap_foliage(temperature: f32, downfall: f32) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Config, DEFAULT_TOML};
+    use crate::horizon_squaremap::config::{Config, DEFAULT_TOML};
 
     fn world() -> WorldConfig {
         Config::parse(DEFAULT_TOML).unwrap().world("minecraft:overworld")

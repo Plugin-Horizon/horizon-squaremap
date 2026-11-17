@@ -4,3 +4,4 @@ test-scratch/
 /target
 /core/target
 Cargo.lock
+.horizon/

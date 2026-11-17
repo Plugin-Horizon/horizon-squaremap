@@ -216,19 +216,19 @@ pub fn clear_markers(world: &str, layer: &str) {
 /// Registers a PNG as icon `key` (served as `images/icon/registered/<key>.png`).
 pub fn register_icon(key: &str, png: Vec<u8>) -> Result<(), String> {
     check_key(key)?;
-    crate::image::decode_rgb(&png).map_err(|e| format!("icon '{key}' is not a PNG: {e}"))?;
+    crate::horizon_squaremap::image::decode_rgb(&png).map_err(|e| format!("icon '{key}' is not a PNG: {e}"))?;
     let new = with(|a| a.icons.insert(key.to_owned(), png.clone()).is_none());
     if !new {
         return Err(format!("icon '{key}' is already registered"));
     }
-    crate::runtime::write_icon(key, &png);
+    crate::horizon_squaremap::runtime::write_icon(key, &png);
     Ok(())
 }
 
 pub fn unregister_icon(key: &str) -> bool {
     let removed = with(|a| a.icons.remove(key).is_some());
     if removed {
-        crate::runtime::remove_icon(key);
+        crate::horizon_squaremap::runtime::remove_icon(key);
     }
     removed
 }

@@ -1,7 +1,7 @@
 //! Region images and their tiles: squaremap's `RegionImage` (MIT, Copyright (c) 2021-2024
 //! Jason Penilla). A region is 512x512 blocks; zoom level `max` holds it at one pixel a
 //! block in `<max>/<rx>_<rz>.png`, each lower level halves it into the tile that covers it.
-use crate::scan::UNSET;
+use crate::horizon_squaremap::scan::UNSET;
 use std::fs;
 use std::io::{self, BufReader, BufWriter};
 use std::path::{Path, PathBuf};

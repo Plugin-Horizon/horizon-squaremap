@@ -4,11 +4,11 @@
 //! north row is redrawn (its shading reads the chunk north of it). A job runs the plan on
 //! its own thread from the region files, saving progress after every region so a stopped
 //! render resumes on the next start.
-use crate::config::WorldConfig;
-use crate::image::RegionImage;
-use crate::region::{DiskCache, WorldEnv};
-use crate::scan::scan_chunk_with;
-use crate::tables::Tables;
+use crate::horizon_squaremap::config::WorldConfig;
+use crate::horizon_squaremap::image::RegionImage;
+use crate::horizon_squaremap::region::{DiskCache, WorldEnv};
+use crate::horizon_squaremap::scan::scan_chunk_with;
+use crate::horizon_squaremap::tables::Tables;
 use serde_json::{json, Value};
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
@@ -545,10 +545,10 @@ fn hms(ms: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Config, DEFAULT_TOML};
-    use crate::region::testdata::{chunk, region};
-    use crate::region::{Ids, Shape};
-    use crate::tables::RawState;
+    use crate::horizon_squaremap::config::{Config, DEFAULT_TOML};
+    use crate::horizon_squaremap::region::testdata::{chunk, region};
+    use crate::horizon_squaremap::region::{Ids, Shape};
+    use crate::horizon_squaremap::tables::RawState;
     use std::sync::Mutex;
 
     #[test]
@@ -618,7 +618,7 @@ mod tests {
             RawState { name: "minecraft:air".into(), ..Default::default() },
             RawState { name: "minecraft:stone".into(), map_color: 11, default_map_color: 11, ..Default::default() },
         ];
-        let biomes = vec![crate::tables::RawBiome { name: "minecraft:plains".into(), ..Default::default() }];
+        let biomes = vec![crate::horizon_squaremap::tables::RawBiome { name: "minecraft:plains".into(), ..Default::default() }];
         let config = Config::parse(DEFAULT_TOML).unwrap().world("minecraft:overworld");
         let tables = Arc::new(Tables::build(&states, &biomes, &config));
         let ids = Arc::new(Ids::new(&states, &["minecraft:plains".into()]));

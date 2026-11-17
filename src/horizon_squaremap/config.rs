@@ -1,11 +1,11 @@
 //! The mod's config: squaremap's `config.yml` and `advanced.yml` as one TOML file, with the
 //! same key names. `world-settings.default` applies to every world; a table named after a
 //! world (`[world-settings."minecraft:the_nether".map]`) overrides keys of it.
-use crate::visibility::{self, Shape};
+use crate::horizon_squaremap::visibility::{self, Shape};
 use serde::Deserialize;
 
 /// Written to `config/squaremap-server.toml` when it is missing.
-pub const DEFAULT_TOML: &str = include_str!("../squaremap-server.toml");
+pub const DEFAULT_TOML: &str = include_str!("../../data/squaremap/squaremap-server.toml");
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]

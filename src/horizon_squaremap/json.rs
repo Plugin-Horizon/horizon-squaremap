@@ -1,6 +1,6 @@
 //! The JSON documents the frontend reads, in squaremap's formats (`WebSettingsPublisher`,
 //! `MarkerDataPublisher`, `PlayerDataPublisher`; MIT, Copyright (c) 2021-2024 Jason Penilla).
-use crate::config::{Config, Layer, WorldConfig};
+use crate::horizon_squaremap::config::{Config, Layer, WorldConfig};
 use serde_json::{json, Value};
 
 /// The three levels a server has, in the order squaremap lists them.
@@ -186,7 +186,7 @@ pub fn players(list: &[Player], max: usize, world: impl Fn(&str) -> (bool, bool)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::DEFAULT_TOML;
+    use crate::horizon_squaremap::config::DEFAULT_TOML;
 
     #[test]
     fn documents_have_squaremaps_shape() {

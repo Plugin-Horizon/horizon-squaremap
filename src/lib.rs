@@ -9,11 +9,14 @@
 //!
 //! Config: `config/squaremap-server.toml` (registered as a Server config; a world's
 //! `serverconfig/squaremap-server.toml` wins). The web server binds 127.0.0.1 by default.
+
+pub mod horizon_squaremap;
 use horizon_squaremap as sm;
 use mod_api::{
     BlockChangedEvent, BlockMetadata, ChunkLoadEvent, ChunkUnloadEvent, Command, CommandArgumentValue, CommandSource,
     HostBlockStates,
-    Config, ConfigKind, ConfigLoadingEvent, ConfigReloadingEvent, Flow, HostSide, Hooks, LivingRef, PlayerCommandEvent,
+    Config, ConfigKind, ConfigLoadingEvent, ConfigReloadingEvent, Flow, HostSide, Hooks, LivingRef, NodeDefault,
+    PermissionGatherNodesEvent, PermissionLevel, PermissionNode, PermissionValueType, PlayerCommandEvent,
     RegisterCommandsEvent, RegisterConfigsEvent, RunModCommandEvent, ServerHost, ServerStartedEvent,
     ServerStoppingEvent, ServerTickEvent, ServerTickPhase, Suggestion, TabCompleteEvent, Text,
 };
@@ -24,6 +27,29 @@ const ID: &str = "squaremap";
 
 /// The dimensions squaremap draws, by their registry ids.
 const DIMENSIONS: [&str; 3] = ["minecraft:overworld", "minecraft:the_nether", "minecraft:the_end"];
+
+/// Every permission node the map checks: the subcommands' (`squaremap.command.<sub>`, the ones
+/// `commands::usages` lists) and the two `.others` nodes. Declared in `permission_gather_nodes`.
+const NODES: [&str; 13] = [
+    "squaremap.command.help",
+    "squaremap.command.cancelrender",
+    "squaremap.command.fullrender",
+    "squaremap.command.pauserender",
+    "squaremap.command.radiusrender",
+    "squaremap.command.resetmap",
+    "squaremap.command.progresslogging",
+    "squaremap.command.hide",
+    "squaremap.command.show",
+    "squaremap.command.reload",
+    "squaremap.command.link",
+    "squaremap.command.hide.others",
+    "squaremap.command.show.others",
+];
+
+/// A Boolean permission node named `name`, as the map's commands ask it.
+fn node(name: &str) -> PermissionNode {
+    PermissionNode::new(name, PermissionValueType::Boolean)
+}
 
 fn log(line: &str) {
     eprintln!("[squaremap] {line}");
@@ -161,8 +187,8 @@ fn publish_players(host: &dyn ServerHost) {
             health: living.health(host).unwrap_or(0.0),
             // `Attributes.ARMOR` with every modifier, as the game answers it.
             armor: living.attribute_value(host, "minecraft:armor").map(|v| v.floor() as i32),
-            // The nickname, where one is set: the closest arismoko has to the display name.
-            display_name: p.nickname(host).flatten(),
+            // HMOD-GAP(nickname): Horizon main can set a nickname but has no getter, so the map shows the real name.
+            display_name: None,
         });
     }
     sm::publish_players(&list, max_players(host));
@@ -306,6 +332,13 @@ impl Hooks for Mod {
         }
     }
 
+    fn permission_gather_nodes(&self, event: &mut PermissionGatherNodesEvent<'_>) {
+        let level = NodeDefault::Level(PermissionLevel::from_level(i32::from(sm::commands::OP_LEVEL)));
+        for name in NODES {
+            let _ = event.nodes.add(node(name), level.clone());
+        }
+    }
+
     fn register_commands(&self, _: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
         for (usage, level) in sm::commands::usages() {
             // squaremap's `word?` (the client asks for world names) is plain `word` here; the
@@ -314,7 +347,7 @@ impl Hooks for Mod {
             // decides when no permissions mod answers. The bare label and `confirm` have none.
             let command = Command::op(&usage.replace("word?", "word"), level);
             event.commands.push(match sm::commands::permission_node(&usage) {
-                Some(node) => command.with_node(&node),
+                Some(name) => command.with_node(&node(&name)),
                 None => command,
             });
         }
@@ -326,8 +359,9 @@ impl Hooks for Mod {
         if !sm::commands::is_ours(event.command) {
             return Flow::Continue;
         }
-        let Some(node) = sm::commands::permission_node(event.command) else { return Flow::Continue };
-        let allowed = host.player(event.player).is_some_and(|p| p.has_permission(&*host, &node));
+        let Some(name) = sm::commands::permission_node(event.command) else { return Flow::Continue };
+        let node = node(&name);
+        let allowed = host.player(event.player).is_some_and(|p| p.permission_bool(&mut *host, &node).unwrap_or(false));
         if allowed {
             return Flow::Continue;
         }
@@ -361,11 +395,12 @@ impl Hooks for Mod {
                 // The usage's node already gated the command (`with_node`); the core is told 4 when the node
                 // (or, without one, the level) lets the player through. `hide`/`show` for others asks its own node.
                 let allowed = match sm::commands::permission_node(&line) {
-                    Some(node) => player.has_permission(&*host, &node),
+                    Some(name) => player.permission_bool(&mut *host, &node(&name)).unwrap_or(false),
                     None => permission.level() >= sm::commands::OP_LEVEL,
                 };
                 let op = if allowed { 4 } else { 0 };
-                let others = sm::commands::others_node(&line).is_some_and(|n| player.has_permission(&*host, &n));
+                let others = sm::commands::others_node(&line)
+                    .is_some_and(|n| player.permission_bool(&mut *host, &node(&n)).unwrap_or(false));
                 sm::commands::Sender {
                     player: Some(sm::commands::SenderPlayer {
                         uuid: player.uuid(),

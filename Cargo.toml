@@ -5,6 +5,11 @@ edition = "2024"
 publish = false
 
 [dependencies]
-# The launcher (or stage.py) points this at the Horizon source the game is built from.
-horizon-mod-api = { git = "https://github.com/arismoko/horizon" }
-horizon-squaremap = { path = "core" }
+# The pinned SDK's API crate, fetched into .horizon/sdk/ by any `cargo horizon-mod` command.
+horizon-mod-api = { path = ".horizon/sdk/api/crates/horizon-mod-api" }
+flate2 = "1"
+png = "0.18"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1.1"
+

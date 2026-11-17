@@ -2,7 +2,7 @@
 //! (`RectangleShape`, `CircleShape`, `PolygonShape`, `WorldBorderShape`; MIT, Copyright (c)
 //! 2021-2024 Jason Penilla). A column, chunk or region is drawn when it is inside any
 //! shape, or when there is no shape at all.
-use crate::config::VisibilityLimit;
+use crate::horizon_squaremap::config::VisibilityLimit;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Shape {

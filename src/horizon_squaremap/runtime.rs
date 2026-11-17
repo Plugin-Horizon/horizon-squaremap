@@ -2,14 +2,14 @@
 //! snapshots into tiles, full and radius renders from the region files, the JSON documents
 //! and the web server. Every public function here is called from the server thread; the
 //! render, job and web threads only get owned or shared data.
-use crate::config::{Config, Hide, WorldConfig};
-use crate::image::RegionImage;
-use crate::json::{self, Player, WORLDS};
-use crate::region::{region_dir, DiskCache, Ids, Shape, WorldEnv};
-use crate::render::{self, Control, Mode, Plan};
-use crate::scan::{scan_chunk_with, ChunkView};
-use crate::tables::{RawBiome, RawState, Tables};
-use crate::web::{JsonStore, WebServer};
+use crate::horizon_squaremap::config::{Config, Hide, WorldConfig};
+use crate::horizon_squaremap::image::RegionImage;
+use crate::horizon_squaremap::json::{self, Player, WORLDS};
+use crate::horizon_squaremap::region::{region_dir, DiskCache, Ids, Shape, WorldEnv};
+use crate::horizon_squaremap::render::{self, Control, Mode, Plan};
+use crate::horizon_squaremap::scan::{scan_chunk_with, ChunkView};
+use crate::horizon_squaremap::tables::{RawBiome, RawState, Tables};
+use crate::horizon_squaremap::web::{JsonStore, WebServer};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -108,7 +108,7 @@ enum Work {
 
 /// The default `config/squaremap-server.toml`.
 pub fn default_config() -> &'static str {
-    crate::config::DEFAULT_TOML
+    crate::horizon_squaremap::config::DEFAULT_TOML
 }
 
 /// The config file was (re)read. A running map picks up everything but the web server.
@@ -121,7 +121,7 @@ pub fn config_loaded(text: &str) {
         }
     };
     let q = &config.settings.image_quality.compress_images;
-    crate::image::set_compression(q.enabled, q.value);
+    crate::horizon_squaremap::image::set_compression(q.enabled, q.value);
     let p = &config.settings.render_progress_logging;
     render::PROGRESS_LOGGING.store(p.enabled, Ordering::Relaxed);
     render::PROGRESS_INTERVAL.store(p.interval_seconds, Ordering::Relaxed);
@@ -174,7 +174,7 @@ fn start_with(args: StartArgs) -> Result<(), String> {
     if config.settings.web_directory.auto_update {
         write_frontend(&web).map_err(|e| format!("writing the web folder {}: {e}", web.display()))?;
     }
-    for (key, png) in crate::api::icons() {
+    for (key, png) in crate::horizon_squaremap::api::icons() {
         write_icon_into(&web, &key, &png);
     }
     let json = Arc::new(JsonStore::default());
@@ -198,7 +198,7 @@ fn start_with(args: StartArgs) -> Result<(), String> {
     let biome_names: Vec<String> = biomes.iter().map(|b| b.name.clone()).collect();
     let ids = Arc::new(Ids::new(&states, &biome_names));
     let data = world_dir.join("squaremap").join("data");
-    crate::api::load_hidden(data.join("hidden-players.json"));
+    crate::horizon_squaremap::api::load_hidden(data.join("hidden-players.json"));
     let now = Instant::now();
     let mut rt = Runtime {
         web,
@@ -266,7 +266,7 @@ pub fn stop() {
 /// web server's address included); hides that weren't persistent are dropped.
 pub fn reload() -> Result<(), String> {
     let args = STARTED.lock().unwrap().clone().ok_or("the map has not started")?;
-    crate::api::clear_temporary_hides();
+    crate::horizon_squaremap::api::clear_temporary_hides();
     start_with(args)
 }
 
@@ -411,7 +411,7 @@ pub fn hide_rules(world: &str) -> Hide {
 /// hidden with `/squaremap hide` or the API are left out here).
 pub fn publish_players(list: &[Player], max: usize) {
     with(|rt| {
-        let shown: Vec<Player> = list.iter().filter(|p| !crate::api::player_hidden(p.uuid)).cloned().collect();
+        let shown: Vec<Player> = list.iter().filter(|p| !crate::horizon_squaremap::api::player_hidden(p.uuid)).cloned().collect();
         let doc = json::players(&shown, max, |w| {
             world_index(w).and_then(|i| rt.worlds.get(i)).map_or((false, false), |w| {
                 (w.config.player_tracker.enabled, w.config.player_tracker.use_display_names)
@@ -454,7 +454,7 @@ pub fn publish_markers(world: usize, spawn: Option<[i32; 2]>, border: [f64; 4]) 
                 w.config = Arc::new(c);
             }
         }
-        let key = format!("{spawn:?}{border:?}{}", crate::api::generation());
+        let key = format!("{spawn:?}{border:?}{}", crate::horizon_squaremap::api::generation());
         if key == w.markers {
             return;
         }
@@ -463,7 +463,7 @@ pub fn publish_markers(world: usize, spawn: Option<[i32; 2]>, border: [f64; 4]) 
         let settings = json::world_settings(&w.config, spawn.unwrap_or_default()).to_string();
         let mut layers = json::markers(&w.config, spawn, border, now_millis());
         if let serde_json::Value::Array(list) = &mut layers {
-            list.extend(crate::api::layers_json(w.id));
+            list.extend(crate::horizon_squaremap::api::layers_json(w.id));
         }
         rt.put(&format!("/tiles/{name}/settings.json"), settings);
         rt.put(&format!("/tiles/{name}/markers.json"), layers.to_string());
@@ -497,7 +497,7 @@ pub fn start_full_render(world: usize) -> Result<(), RenderRefused> {
             Box::new(move |_| {
                 eprintln!("[squaremap] Scanning region files for {id}... (this may take a moment)");
                 let found: Vec<_> =
-                    crate::region::list_regions(&dir).into_iter().filter(|&(x, z)| config.map.region_visible(x, z)).collect();
+                    crate::horizon_squaremap::region::list_regions(&dir).into_iter().filter(|&(x, z)| config.map.region_visible(x, z)).collect();
                 let plan = Plan::regions(&render::order_regions(found), |x, z| config.map.chunk_visible(x, z));
                 eprintln!("[squaremap] Found {} region files for {id}", plan.regions.len());
                 plan
@@ -741,7 +741,7 @@ impl Runtime {
 
 /// Writes the bundled frontend into the web folder, plus the spawn icon squaremap registers.
 fn write_frontend(web: &Path) -> std::io::Result<()> {
-    for (path, bytes) in crate::assets::FILES {
+    for (path, bytes) in crate::horizon_squaremap::assets::FILES {
         let file = web.join(path);
         if let Some(parent) = file.parent() {
             std::fs::create_dir_all(parent)?;
@@ -750,7 +750,7 @@ fn write_frontend(web: &Path) -> std::io::Result<()> {
     }
     let icon = web.join("images/icon/registered");
     std::fs::create_dir_all(&icon)?;
-    std::fs::write(icon.join("squaremap-spawn_icon.png"), crate::assets::file("images/icon/spawn.png").unwrap_or_default())
+    std::fs::write(icon.join("squaremap-spawn_icon.png"), crate::horizon_squaremap::assets::file("images/icon/spawn.png").unwrap_or_default())
 }
 
 /// Deletes what a tiles folder holds, keeping the folder.
