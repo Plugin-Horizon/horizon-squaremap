@@ -57,7 +57,8 @@ This is a native trait mod: `horizon-mod.toml`, a `Cargo.toml` that depends on `
   `9 * value`, as ImageIO's PNG writer does with squaremap's setting.
 - **Web server.** `std::net`, GET/HEAD only, the JSON documents from memory, files from
   the web folder, binds `127.0.0.1` by default. The frontend is squaremap 1.4.3's,
-  written into the web folder on start (`web-directory.auto-update`).
+  written into the web folder on start (`web-directory.auto-update`), without its Minecraft-derived images
+  (hearts, armor, sky backgrounds), which the registry policy keeps out of mods; a map shows none of them.
 
 ## Config
 
