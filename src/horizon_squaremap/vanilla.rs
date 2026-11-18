@@ -3,7 +3,9 @@
 //! names come from `registries.json` and `data/minecraft/worldgen/biome/*.json`; the host then
 //! answers each block's states and map colours (see the glue in `src/lib.rs`).
 use crate::horizon_squaremap::tables::{GrassModifier, RawBiome};
+use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::Mutex;
 
 /// Every block id (`minecraft:stone`), sorted, from `registries.json` (`minecraft:block`).
 pub fn block_names(resources: &Path) -> Vec<String> {
@@ -39,20 +41,43 @@ fn colour(v: &serde_json::Value) -> Option<u32> {
     }
 }
 
-/// `GrassColor.get` / `FoliageColor.get` on one of the shipped colormaps.
-fn colormap(file: &str, temperature: f32, downfall: f32) -> Option<u32> {
-    let bytes = crate::horizon_squaremap::assets::file(file)?;
-    let (_, _, px) = crate::horizon_squaremap::image::decode_rgb(bytes).ok()?;
+/// The game's three biome colour maps (`assets/minecraft/textures/colormap/<name>.png`), read from the
+/// resource folder at start: the mod ships no Minecraft textures. Empty until [`load_colormaps`] ran or
+/// when a file is missing; a biome then gets the flat default colour of its kind.
+static COLORMAPS: Mutex<BTreeMap<String, Vec<u32>>> = Mutex::new(BTreeMap::new());
+
+/// Reads `grass`, `foliage` and `dry_foliage` from the resource folder (replacing earlier ones).
+pub fn load_colormaps(resources: &Path) {
+    let dir = resources.join("assets").join("minecraft").join("textures").join("colormap");
+    let mut maps = BTreeMap::new();
+    for name in ["grass", "foliage", "dry_foliage"] {
+        let Ok(bytes) = std::fs::read(dir.join(format!("{name}.png"))) else { continue };
+        if let Ok((_, _, px)) = crate::horizon_squaremap::image::decode_rgb(&bytes) {
+            maps.insert(name.to_owned(), px);
+        }
+    }
+    *COLORMAPS.lock().unwrap_or_else(|e| e.into_inner()) = maps;
+}
+
+/// Replaces the colour maps (tests hand in a synthetic 256x256 map).
+#[cfg(test)]
+pub fn set_colormap_for_tests(name: &str, px: Vec<u32>) {
+    COLORMAPS.lock().unwrap_or_else(|e| e.into_inner()).insert(name.to_owned(), px);
+}
+
+/// `GrassColor.get` / `FoliageColor.get` on one of the colour maps; `None` when it is not loaded.
+pub fn colormap(name: &str, temperature: f32, downfall: f32) -> Option<u32> {
     let t = f64::from(temperature.clamp(0.0, 1.0));
     let h = f64::from(downfall.clamp(0.0, 1.0)) * t;
     let i = ((1.0 - t) * 255.0) as usize;
     let j = ((1.0 - h) * 255.0) as usize;
-    px.get(j << 8 | i).map(|c| c & 0xFF_FFFF)
+    COLORMAPS.lock().unwrap_or_else(|e| e.into_inner()).get(name)?.get(j << 8 | i).map(|c| c & 0xFF_FFFF)
 }
 
 /// Every biome of `data/minecraft/worldgen/biome`, by file name, with the climate and the colours
 /// its file sets (the colormaps' otherwise). Sorted by name. Biomes of data packs are not listed.
 pub fn biomes(resources: &Path) -> Vec<RawBiome> {
+    load_colormaps(resources);
     let dir = resources.join("data").join("minecraft").join("worldgen").join("biome");
     let Ok(read) = std::fs::read_dir(&dir) else { return Vec::new() };
     let mut out = Vec::new();
@@ -76,9 +101,9 @@ pub fn biomes(resources: &Path) -> Vec<RawBiome> {
             name: format!("minecraft:{stem}"),
             temperature,
             downfall,
-            grass: set("grass_color").or_else(|| colormap("images/grass.png", temperature, downfall)).unwrap_or(0x91BD59),
-            foliage: set("foliage_color").or_else(|| colormap("images/foliage.png", temperature, downfall)).unwrap_or(0x77AB2F),
-            dry_foliage: set("dry_foliage_color").or_else(|| colormap("images/dry_foliage.png", temperature, downfall)).unwrap_or(0x7B5334),
+            grass: set("grass_color").or_else(|| colormap("grass", temperature, downfall)).unwrap_or(0x91BD59),
+            foliage: set("foliage_color").or_else(|| colormap("foliage", temperature, downfall)).unwrap_or(0x77AB2F),
+            dry_foliage: set("dry_foliage_color").or_else(|| colormap("dry_foliage", temperature, downfall)).unwrap_or(0x7B5334),
             water: set("water_color").unwrap_or(0x3F76E4),
             modifier,
         });
@@ -105,5 +130,16 @@ mod tests {
     fn colours_parse_from_hex_text() {
         assert_eq!(colour(&serde_json::json!("#6a7039")), Some(0x6A7039));
         assert_eq!(colour(&serde_json::json!(5)), Some(5));
+    }
+
+    #[test]
+    fn colormaps_are_read_from_the_resource_folder() {
+        // Needs a prepared game resource folder; without one the check is skipped.
+        let Some(dir) = std::env::var_os("HORIZON_TEST_RESOURCES") else { return };
+        load_colormaps(std::path::Path::new(&dir));
+        let plains = colormap("grass", 0.8, 0.4).expect("grass colormap");
+        let desert = colormap("grass", 2.0, 0.0).expect("grass colormap");
+        assert_ne!(plains, desert);
+        assert!(colormap("foliage", 0.8, 0.4).is_some() && colormap("dry_foliage", 0.8, 0.4).is_some());
     }
 }

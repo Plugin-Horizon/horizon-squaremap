@@ -10,6 +10,6 @@ built frontend; it bundles Leaflet (BSD 2-Clause), see LICENSE.
 
 Left out of the bundled web frontend: squaremap's armor and health icons, the three sky backgrounds and the
 preview image (Minecraft-derived art). The player tooltip therefore shows no hearts or armor icons, and the map
-has no sky background. Kept: the three biome colour maps (grass, foliage, dry foliage; Minecraft textures), because
-the renderer samples them for biome tints. They belong to Mojang AB / Microsoft; see the open point in the
-registry submission notes. This project is not affiliated with or endorsed by Mojang or Microsoft.
+has no sky background. The three biome colour maps (grass, foliage, dry foliage) are not shipped either: the mod
+reads them from the game's own resource folder (`assets/minecraft/textures/colormap/`) when it starts. This project
+is not affiliated with or endorsed by Mojang or Microsoft.

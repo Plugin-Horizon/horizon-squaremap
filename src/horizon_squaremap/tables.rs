@@ -4,7 +4,6 @@
 //! `BiomeColorSampler` (MIT, Copyright (c) 2021-2024 Jason Penilla).
 use crate::horizon_squaremap::color::{self, WATER_MAP_COLOR};
 use crate::horizon_squaremap::config::WorldConfig;
-use std::sync::OnceLock;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Fluid {
@@ -224,19 +223,9 @@ fn dynamic_color(name: &str, age: Option<u8>) -> Option<u32> {
     }
 }
 
-/// `FoliageColor.get` from the colormap the web frontend ships (`images/foliage.png`).
+/// `FoliageColor.get` from the game's foliage colour map (see `vanilla::load_colormaps`).
 fn colormap_foliage(temperature: f32, downfall: f32) -> Option<u32> {
-    static MAP: OnceLock<Vec<u32>> = OnceLock::new();
-    let map = MAP.get_or_init(|| {
-        crate::horizon_squaremap::image::decode_rgb(crate::horizon_squaremap::assets::file("images/foliage.png").unwrap_or_default())
-            .map(|(_, _, px)| px)
-            .unwrap_or_default()
-    });
-    let t = f64::from(temperature.clamp(0.0, 1.0));
-    let h = f64::from(downfall.clamp(0.0, 1.0));
-    let i = ((1.0 - t) * 255.0) as usize;
-    let j = ((1.0 - h * t) * 255.0) as usize;
-    map.get(j << 8 | i).map(|c| c & 0xFF_FFFF)
+    crate::horizon_squaremap::vanilla::colormap("foliage", temperature, downfall)
 }
 
 #[cfg(test)]
@@ -303,7 +292,10 @@ mod tests {
 
     #[test]
     fn foliage_default_is_mixed_with_plant_and_overrides_win() {
+        // A synthetic map of one colour: any lookup returns it.
+        crate::horizon_squaremap::vanilla::set_colormap_for_tests("foliage", vec![0x336699; 256 * 256]);
         let sampled = colormap_foliage(0.8, 0.4).expect("colormap present");
+        assert_eq!(sampled, 0x336699);
         let raw = [
             RawBiome { name: "minecraft:plains".into(), temperature: 0.8, downfall: 0.4, foliage: sampled, ..Default::default() },
             RawBiome { name: "minecraft:jungle".into(), temperature: 0.95, downfall: 0.9, foliage: 1, ..Default::default() },
