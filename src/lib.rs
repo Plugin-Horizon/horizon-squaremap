@@ -15,7 +15,8 @@ use horizon_squaremap as sm;
 use mod_api::{
     BlockChangedEvent, BlockMetadata, ChunkLoadEvent, ChunkUnloadEvent, Command, CommandArgumentValue, CommandSource,
     HostBlockStates,
-    Config, ConfigKind, ConfigLoadingEvent, ConfigReloadingEvent, Flow, HostSide, Hooks, LivingRef, NodeDefault,
+    Config, ConfigKind, ConfigLoadingEvent, ConfigReloadingEvent, EquipmentSlot, Flow, HostSide, Hooks, LivingRef,
+    NodeDefault,
     PermissionGatherNodesEvent, PermissionLevel, PermissionNode, PermissionValueType, PlayerCommandEvent,
     RegisterCommandsEvent, RegisterConfigsEvent, RunModCommandEvent, ServerHost, ServerStartedEvent,
     ServerStoppingEvent, ServerTickEvent, ServerTickPhase, Suggestion, TabCompleteEvent, Text,
@@ -155,15 +156,32 @@ fn render_tables(host: &dyn ServerHost) -> Option<(Vec<sm::RawState>, Vec<sm::Ra
     Some((states, biomes, sm::WorldEnv::plain()))
 }
 
-/// The border of a dimension's level, when it is loaded.
-fn level_border(host: &mut dyn ServerHost, dimension: &str) -> Option<[f64; 4]> {
+/// The border of a dimension's level and the world spawn column (`LevelData.getRespawnData`, one spawn
+/// for every level), when the level is loaded.
+fn level_border(host: &mut dyn ServerHost, dimension: &str) -> Option<([f64; 4], Option<[i32; 2]>)> {
     let level = host.level(dimension)?;
-    level.world_border(&*host)
+    let border = level.world_border(&*host)?;
+    let spawn = level.respawn_data(&*host).map(|r| [r.pos[0], r.pos[2]]);
+    Some((border, spawn))
 }
 
-/// The players squaremap draws. Spectators are left out with the `spectators` hide rule.
-// TODO(arismoko-api: living_effects): the `invisible` hide rule (invisibility effect) is not applied.
-// TODO(arismoko-api: item_in_tag): the `map-invisibility-equipment` hide rule is not applied.
+/// What `minecraft:map_invisibility_equipment` holds (the item tag has no query on Horizon, so its one
+/// vanilla entry stands in; a datapack that edits the tag is not followed).
+const MAP_INVISIBILITY_ITEMS: [&str; 1] = ["minecraft:carved_pumpkin"];
+
+/// `MapItemSavedData.hasMapInvisibilityItemEquipped`: an item of the tag in an armour or body slot.
+fn has_map_invisibility_equipment(host: &dyn ServerHost, living: LivingRef) -> bool {
+    [EquipmentSlot::Feet, EquipmentSlot::Legs, EquipmentSlot::Chest, EquipmentSlot::Head, EquipmentSlot::Body, EquipmentSlot::Saddle]
+        .into_iter()
+        .any(|slot| {
+            living
+                .equipment(host, slot)
+                .is_some_and(|stack| MAP_INVISIBILITY_ITEMS.contains(&stack.item().id(host).as_str()))
+        })
+}
+
+/// The players squaremap draws, less the ones a level's `player-tracker.hide` rules leave out:
+/// spectators, invisible players (the invisibility effect) and map invisibility equipment.
 fn publish_players(host: &dyn ServerHost) {
     let mut list = Vec::new();
     for p in host.players().server_players() {
@@ -173,11 +191,18 @@ fn publish_players(host: &dyn ServerHost) {
             continue;
         };
         let world = world.to_string();
-        if sm::hide_rules(&world).spectators && p.is_spectator(host) == Some(true) {
+        let rules = sm::hide_rules(&world);
+        if rules.spectators && p.is_spectator(host) == Some(true) {
             continue;
         }
         let entity = p.entity();
         let living = LivingRef::new(entity);
+        if rules.invisible && entity.is_invisible(host) == Some(true) {
+            continue;
+        }
+        if rules.map_invisibility_equipment && has_map_invisibility_equipment(host, living) {
+            continue;
+        }
         list.push(sm::Player {
             uuid: p.uuid(),
             name,
@@ -303,9 +328,8 @@ impl Hooks for Mod {
                 sm::not_loaded(w, cx, cz);
             }
             if sm::markers_due(w) {
-                // TODO(arismoko-api: level_world_spawn): no spawn marker (`None`).
-                if let Some(border) = level_border(host, dimension) {
-                    sm::publish_markers(w, None, border);
+                if let Some((border, spawn)) = level_border(host, dimension) {
+                    sm::publish_markers(w, spawn, border);
                 }
             }
         }
@@ -365,7 +389,7 @@ impl Hooks for Mod {
         if allowed {
             return Flow::Continue;
         }
-        event.replies.push(Text::literal("\u{a7}cI'm sorry, but you do not have permission to perform this command. Please contact the server administrators if you believe that this is in error."));
+        event.replies.push(line_text(&sm::commands::no_permission()));
         event.cancelled = true;
         Flow::Cancel
     }

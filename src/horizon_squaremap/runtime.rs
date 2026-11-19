@@ -388,14 +388,14 @@ pub fn submit(world: usize, view: Box<dyn ChunkView>) {
     });
 }
 
-/// Whether the player list is due (`player-tracker.update-interval-seconds`).
+/// Whether the player list is due: every second, as `PlayerDataPublisher` runs (squaremap's
+/// `player-tracker.update-interval-seconds` is only how often the web page asks for the file, per level).
 pub fn players_due() -> bool {
     with(|rt| {
         let now = Instant::now();
-        let every = rt.worlds.first().map_or(1, |w| w.config.player_tracker.update_interval_seconds);
         let due = now >= rt.next_players;
         if due {
-            rt.next_players = now + Duration::from_secs(every.max(1));
+            rt.next_players = now + Duration::from_secs(1);
         }
         due
     })
@@ -413,8 +413,14 @@ pub fn publish_players(list: &[Player], max: usize) {
     with(|rt| {
         let shown: Vec<Player> = list.iter().filter(|p| !crate::horizon_squaremap::api::player_hidden(p.uuid)).cloned().collect();
         let doc = json::players(&shown, max, |w| {
-            world_index(w).and_then(|i| rt.worlds.get(i)).map_or((false, false), |w| {
-                (w.config.player_tracker.enabled, w.config.player_tracker.use_display_names)
+            world_index(w).and_then(|i| rt.worlds.get(i)).map_or(json::TrackerShows::default(), |w| {
+                let t = &w.config.player_tracker;
+                json::TrackerShows {
+                    tracker: t.enabled,
+                    display_names: t.use_display_names,
+                    armor: t.nameplate.show_armor,
+                    health: t.nameplate.show_health,
+                }
             })
         })
         .to_string();

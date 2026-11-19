@@ -31,9 +31,10 @@ pub struct SenderPlayer {
     pub z: f64,
 }
 
-/// The operator level the map's commands need (squaremap's nodes default to operators on
-/// Paper). `confirm` and the bare label have no node, so everyone may run them.
-pub const OP_LEVEL: u8 = 2;
+/// The operator level the map's commands need: squaremap's nodes are unregistered Bukkit nodes, which
+/// default to operators of any level (1 and up). `confirm` and the bare label have no node, so everyone
+/// may run them.
+pub const OP_LEVEL: u8 = 1;
 
 /// The node the bare label is registered with. The host gates a whole root command by the
 /// first node its usages give, so this one stays open (level 0) unless a permissions mod denies
@@ -210,7 +211,8 @@ fn invalid_syntax(usage: &str) -> Line {
     ])
 }
 
-fn no_permission() -> Line {
+/// squaremap's `command.message.exception.no-permission`, as the player sees it.
+pub fn no_permission() -> Line {
     error(vec![colored(
         "I'm sorry, but you do not have permission to perform this command.\nPlease contact the server administrators if you believe that this is in error.",
         RED,

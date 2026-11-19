@@ -152,9 +152,23 @@ pub fn html_escape(s: &str) -> String {
     out
 }
 
-/// `/tiles/players.json`. Players already filtered by the hide rules; `world` gives a
-/// level's (`player-tracker.enabled`, `use-display-names`).
-pub fn players(list: &[Player], max: usize, world: impl Fn(&str) -> (bool, bool)) -> Value {
+/// What a level's `player-tracker` says about a player entry.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TrackerShows {
+    /// `player-tracker.enabled`: position, yaw and the nameplate numbers.
+    pub tracker: bool,
+    /// `player-tracker.use-display-names`.
+    pub display_names: bool,
+    /// `player-tracker.nameplate.show-armor`.
+    pub armor: bool,
+    /// `player-tracker.nameplate.show-health`.
+    pub health: bool,
+}
+
+/// `/tiles/players.json`. Players already filtered by the hide rules; `world` says what a level's
+/// tracker shows. As `PlayerDataPublisher`, `armor` and `health` are left out when their nameplate
+/// option is off, and an armor value that could not be read is 0.
+pub fn players(list: &[Player], max: usize, world: impl Fn(&str) -> TrackerShows) -> Value {
     let players: Vec<Value> = list
         .iter()
         .map(|p| {
@@ -163,7 +177,8 @@ pub fn players(list: &[Player], max: usize, world: impl Fn(&str) -> (bool, bool)
                 "uuid": format!("{:032x}", p.uuid),
                 "world": web_name(&p.world),
             });
-            let (tracker_enabled, display_names) = world(&p.world);
+            let shows = world(&p.world);
+            let (tracker_enabled, display_names) = (shows.tracker, shows.display_names);
             if display_names {
                 v["display_name"] = json!(html_escape(p.display_name.as_deref().unwrap_or(&p.name)));
             }
@@ -172,9 +187,11 @@ pub fn players(list: &[Player], max: usize, world: impl Fn(&str) -> (bool, bool)
                 v["y"] = json!(p.position[1].floor() as i64);
                 v["z"] = json!(p.position[2].floor() as i64);
                 v["yaw"] = json!(p.yaw.round() as i64);
-                v["health"] = json!(p.health as i32);
-                if let Some(a) = p.armor {
-                    v["armor"] = json!(a);
+                if shows.armor {
+                    v["armor"] = json!(p.armor.unwrap_or(0));
+                }
+                if shows.health {
+                    v["health"] = json!(p.health as i32);
                 }
             }
             v
@@ -212,14 +229,19 @@ mod tests {
             armor: None,
             display_name: Some("<Al & ex>".into()),
         };
-        let j = players(&[p.clone()], 20, |_| (true, false));
+        let all = TrackerShows { tracker: true, display_names: false, armor: true, health: true };
+        let j = players(&[p.clone()], 20, |_| all);
         assert!(j["players"][0].get("display_name").is_none());
-        let d = players(&[p], 20, |_| (false, true));
+        let d = players(&[p.clone()], 20, |_| TrackerShows { tracker: false, display_names: true, armor: true, health: true });
         assert_eq!(d["players"][0]["display_name"], "&lt;Al &amp; ex&gt;");
         assert!(d["players"][0].get("x").is_none());
         assert_eq!(j["players"][0]["uuid"], "123456789abcdef0123456789abcdef0");
         assert_eq!(j["players"][0]["z"], -1);
         assert_eq!(j["players"][0]["health"], 19);
-        assert!(j["players"][0].get("armor").is_none());
+        assert_eq!(j["players"][0]["armor"], 0, "an unreadable armor value is 0");
+        let no_numbers = players(&[p], 20, |_| TrackerShows { tracker: true, display_names: false, armor: false, health: false });
+        assert!(no_numbers["players"][0].get("armor").is_none());
+        assert!(no_numbers["players"][0].get("health").is_none());
+        assert_eq!(no_numbers["players"][0]["x"], 1);
     }
 }
