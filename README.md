@@ -109,11 +109,16 @@ horizon-launcher native-build <path to this folder> --server-output <dir> --vers
 
 ## Known gaps
 
-What does not work yet on arismoko/horizon (each is marked `TODO(arismoko-api: ...)` in `src/lib.rs`):
+What does not work yet on arismoko/horizon (each is marked `TODO(arismoko-api: ...)` or `HMOD-GAP(...)` in `src/lib.rs`):
 
-- The web renderer does not start yet: arismoko has no block-state, biome or biome-zoom tables to render from, so commands answer and the config is read, but no tiles are drawn.
-- Loaded chunks are not snapshotted; tiles come from the region files.
-- No spawn marker; the invisibility and equipment hide rules for players are not applied.
+- The web renderer starts (the block-state and biome tables are built from the resource folder and the host); with the tables missing the commands still answer and the config is read, but no tiles are drawn.
+- Loaded chunks are not snapshotted (no chunk snapshot API), and the glue does not yet hand disk views of due chunks to the render thread: the live map does not redraw changed chunks in the background; `fullrender` and `radiusrender` draw what the region files hold.
+- Only the three vanilla dimensions are mapped (`minecraft:overworld`, `the_nether`, `the_end`); other levels are not listed, rendered or accepted by `fullrender`/`resetmap`.
+- Display names are the real names (no nickname getter on Horizon).
+- The `map-invisibility-equipment` hide rule checks the vanilla tag's one entry (carved pumpkin): there is no item tag query.
+- Configuration is `config/squaremap-server.toml` (TOML): the original `config.yml`, `advanced.yml` and language files are not read, so messages are fixed English text, and the full and radius render settings (workers, limits) are not read.
+- `/squaremap help` prints a flat list (not cloud's paged help), the bare `/squaremap` prints it too (the original answers with its invalid-syntax line), `radiusrender` takes two plain coordinates (no `~`/`^`) and `hide`/`show <player>` take a name (no selector).
+- Region files compressed with LZ4 are skipped; the swamp grass noise of chunks read from disk is approximated.
 
 ## Licence
 

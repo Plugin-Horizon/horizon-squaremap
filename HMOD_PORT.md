@@ -7,9 +7,11 @@ Round 1
   - `src/lib.rs` `publish_players`: `nickname` has no Horizon main counterpart; `display_name: None` with a `HMOD-GAP` comment.
   - Imports added for the permission types.
   - `src/horizon_squaremap/commands.rs` is unchanged: its string-returning helpers and their tests stay as they were.
-- Permission nodes: `squaremap.command.{help,cancelrender,fullrender,pauserender,radiusrender,resetmap,progresslogging,hide,show,reload,link}` and `squaremap.command.hide.others`, `squaremap.command.show.others` -> Level 2, declared in `src/lib.rs` `permission_gather_nodes` from `NODES`.
+- Permission nodes: `squaremap.command.{help,cancelrender,fullrender,pauserender,radiusrender,resetmap,progresslogging,hide,show,reload,link}` and `squaremap.command.hide.others`, `squaremap.command.show.others` -> Level 1 (any operator, as Bukkit's default for an unregistered node; Level 2 in round 1), declared in `src/lib.rs` `permission_gather_nodes` from `NODES`.
 - Gaps:
   - HMOD-GAP(nickname): Horizon main has `set_nickname` but no getter. The map's `display_name` is always the real name.
+  - HMOD-GAP(chunk_snapshot): no chunk snapshot API; changed loaded chunks are not redrawn in the background.
+  - HMOD-GAP(item_in_tag): no item tag query; the `map-invisibility-equipment` rule uses the vanilla tag's entry (carved pumpkin).
 - Unsure:
   - `NODES` is a fixed list, not derived from `commands::usages()`, because `usages()` reads the runtime config (not loaded at gather time). If the label or the command set changes, `NODES` must follow.
   - The `.others` nodes had no declared default before. I chose Level 2 to match the subcommand nodes.
