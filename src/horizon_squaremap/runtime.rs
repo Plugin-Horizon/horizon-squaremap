@@ -25,6 +25,8 @@ pub const MAX_IN_FLIGHT: usize = 256;
 const FLUSH_EVERY: Duration = Duration::from_secs(5);
 /// The render thread reopens region files this often (for biomes next to a snapshot).
 const DISK_REFRESH: Duration = Duration::from_secs(30);
+/// Chunks drawn from the region files within this long of each other share one reading of them.
+const DISK_BURST: Duration = Duration::from_secs(2);
 
 static CONFIG: Mutex<Option<Config>> = Mutex::new(None);
 static RUNTIME: Mutex<Option<Runtime>> = Mutex::new(None);
@@ -61,6 +63,9 @@ struct World {
     dirty: HashSet<(i32, i32)>,
     /// Dirty chunks that were unloaded before their turn: drawn when they load again.
     stale: HashSet<(i32, i32)>,
+    /// Changed chunks that are still loaded: their new blocks reach the region files with the next world save, and
+    /// they are drawn from there then (`world_saved`).
+    unsaved: HashSet<(i32, i32)>,
     /// This interval's batch, drawn as the level ticks.
     ready: VecDeque<(i32, i32)>,
     next_batch: Instant,
@@ -99,11 +104,36 @@ enum Work {
         region_dir: Arc<PathBuf>,
         ids: Arc<Ids>,
     },
+    /// A chunk drawn from the region files, read on the render thread (a changed chunk once it is saved).
+    Disk {
+        world: usize,
+        cx: i32,
+        cz: i32,
+        tables: Arc<Tables>,
+        config: Arc<WorldConfig>,
+        region_dir: Arc<PathBuf>,
+        ids: Arc<Ids>,
+        env: Arc<WorldEnv>,
+    },
     /// A finished region of a full or radius render.
     Region { world: usize, image: RegionImage, max_zoom: i32, unsaved: Arc<AtomicUsize> },
     /// `resetmap`: drop the level's pending images and empty its tiles folder.
     Reset { world: usize, done: mpsc::Sender<std::io::Result<()>> },
     Stop,
+}
+
+/// squaremap's own `config.yml` / `advanced.yml`, laid over the `config/squaremap-server.toml` text.
+static YAML_LAYERS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Sets the YAML files laid over the TOML config (`config.yml`, then `advanced.yml`; none for a server without them).
+/// They apply with the next [`config_loaded`].
+pub fn set_yaml_layers(layers: Vec<String>) {
+    *YAML_LAYERS.lock().unwrap() = layers;
+}
+
+/// The language file's name (`settings.language-file`).
+pub fn language_file() -> String {
+    config().settings.language_file
 }
 
 /// The default `config/squaremap-server.toml`.
@@ -113,7 +143,8 @@ pub fn default_config() -> &'static str {
 
 /// The config file was (re)read. A running map picks up everything but the web server.
 pub fn config_loaded(text: &str) {
-    let config = match Config::parse(text) {
+    let layers = YAML_LAYERS.lock().unwrap().clone();
+    let config = match Config::parse_layers(text, &layers) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("[squaremap] config not loaded, keeping the previous one: {e}");
@@ -303,7 +334,8 @@ pub fn chunk_unloaded(world: usize, cx: i32, cz: i32) {
     }
 }
 
-fn is_loaded(world: usize, cx: i32, cz: i32) -> bool {
+/// Whether the level has the chunk loaded now.
+pub fn is_loaded(world: usize, cx: i32, cz: i32) -> bool {
     LOADED.lock().unwrap().as_ref().is_some_and(|l| l.contains(&(world, cx, cz)))
 }
 
@@ -358,6 +390,57 @@ pub fn due_chunks(world: usize) -> Vec<(i32, i32)> {
         w.ready.drain(..n).collect()
     })
     .unwrap_or_default()
+}
+
+/// A due chunk. One that is still loaded has its new blocks in memory only: it waits for the next world save and is
+/// drawn from the region files then (`world_saved`), so a tile is never redrawn from the old save. One that was
+/// unloaded since it changed was saved on its way out and is drawn from the region files now.
+pub fn due_chunk(world: usize, cx: i32, cz: i32) {
+    if is_loaded(world, cx, cz) {
+        with(|rt| {
+            if let Some(w) = rt.worlds.get_mut(world) {
+                w.unsaved.insert((cx, cz));
+            }
+        });
+    } else {
+        submit_disk(world, cx, cz);
+    }
+}
+
+/// A world save finished: the changed chunks that waited for it are drawn from the region files.
+pub fn world_saved() {
+    let waiting: Vec<(usize, i32, i32)> = with(|rt| {
+        rt.worlds
+            .iter_mut()
+            .enumerate()
+            .flat_map(|(i, w)| std::mem::take(&mut w.unsaved).into_iter().map(move |(x, z)| (i, x, z)))
+            .collect()
+    })
+    .unwrap_or_default();
+    for (world, cx, cz) in waiting {
+        submit_disk(world, cx, cz);
+    }
+}
+
+/// Hands a chunk to the render thread to be drawn from the region files.
+pub fn submit_disk(world: usize, cx: i32, cz: i32) {
+    with(|rt| {
+        let Some(w) = rt.worlds.get(world) else { return };
+        let job = Work::Disk {
+            world,
+            cx,
+            cz,
+            tables: w.tables.clone(),
+            config: w.config.clone(),
+            region_dir: Arc::new(region_dir(&rt.dir, w.id)),
+            ids: rt.ids.clone(),
+            env: rt.env.clone(),
+        };
+        rt.in_flight.fetch_add(1, Ordering::Relaxed);
+        if rt.jobs.send(job).is_err() {
+            rt.in_flight.fetch_sub(1, Ordering::Relaxed);
+        }
+    });
 }
 
 /// A due chunk wasn't loaded: drawn once it loads again.
@@ -596,6 +679,7 @@ pub fn reset_map(world: usize) -> Result<(), String> {
         w.dirty.clear();
         w.ready.clear();
         w.stale.clear();
+        w.unsaved.clear();
         w.markers.clear();
         let (tx, rx) = mpsc::channel();
         rt.jobs.send(Work::Reset { world, done: tx }).map_err(|e| e.to_string())?;
@@ -721,6 +805,7 @@ impl Runtime {
                 tables: Arc::new(tables),
                 dirty: HashSet::new(),
                 stale: HashSet::new(),
+                unsaved: HashSet::new(),
                 ready: VecDeque::new(),
                 next_batch: now,
                 next_markers: now,
@@ -732,6 +817,7 @@ impl Runtime {
             if let Some(o) = previous {
                 w.dirty = std::mem::take(&mut o.dirty);
                 w.stale = std::mem::take(&mut o.stale);
+                w.unsaved = std::mem::take(&mut o.unsaved);
                 w.ready = std::mem::take(&mut o.ready);
                 w.next_batch = o.next_batch;
                 w.paused = o.paused.clone();
@@ -819,6 +905,31 @@ fn render_loop(rx: mpsc::Receiver<Work>, tiles: PathBuf, in_flight: Arc<AtomicUs
                     .entry((world, rx_, rz_))
                     .or_insert_with(|| (RegionImage::new(rx_, rz_), config.map.zoom.maximum));
                 entry.0.put_chunk(cx, cz, &px);
+                in_flight.fetch_sub(1, Ordering::Relaxed);
+            }
+            Some(Work::Disk { world, cx, cz, tables, config, region_dir, ids, env }) => {
+                // A chunk was just saved: its files and decoded neighbours are read afresh (a burst after one save shares
+                // one reading).
+                let shape = shape(world);
+                let fresh = |ids: Arc<Ids>| (DiskCache::new((*region_dir).clone(), ids, shape), Instant::now());
+                let disk = disks.entry(world).or_insert_with(|| fresh(ids.clone()));
+                if disk.1.elapsed() >= DISK_BURST || disk.0.shape() != shape {
+                    *disk = fresh(ids);
+                }
+                if let Some(view) = disk.0.view(cx, cz, env) {
+                    let px = {
+                        let cache = RefCell::new(&mut disk.0);
+                        let fallback = |qx: i32, qy: i32, qz: i32| cache.borrow_mut().noise_biome(qx, qy, qz);
+                        let px = scan_chunk_with(&view, &tables, &config.map, false, Some(&fallback));
+                        cache.borrow_mut().errors.clear();
+                        px
+                    };
+                    let (rx_, rz_) = (cx >> 5, cz >> 5);
+                    let entry = regions
+                        .entry((world, rx_, rz_))
+                        .or_insert_with(|| (RegionImage::new(rx_, rz_), config.map.zoom.maximum));
+                    entry.0.put_chunk(cx, cz, &px);
+                }
                 in_flight.fetch_sub(1, Ordering::Relaxed);
             }
             Some(Work::Region { world, image, max_zoom, unsaved }) => {

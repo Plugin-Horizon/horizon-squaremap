@@ -5,6 +5,7 @@
 use crate::horizon_squaremap::json::WORLDS;
 use crate::horizon_squaremap::render::{Mode, PROGRESS_INTERVAL, PROGRESS_LOGGING};
 use crate::horizon_squaremap::runtime::{self, RenderRefused};
+use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -29,6 +30,8 @@ pub struct SenderPlayer {
     pub world: String,
     pub x: f64,
     pub z: f64,
+    /// Which way the sender faces, in degrees (0 facing south), for `^` local coordinates.
+    pub yaw: f64,
 }
 
 /// The operator level the map's commands need: squaremap's nodes are unregistered Bukkit nodes, which
@@ -47,6 +50,7 @@ const GREEN: u32 = 0x55FF55;
 const GRAY: u32 = 0xAAAAAA;
 const WHITE: u32 = 0xFFFFFF;
 const PRIMARY: u32 = 0x5B00FF;
+const DARK_GRAY: u32 = 0x555555;
 
 /// The usages to register, each with the operator level it needs, for the configured label and
 /// aliases.
@@ -145,7 +149,7 @@ pub enum Click {
 pub struct Part {
     pub text: String,
     pub color: Option<u32>,
-    pub hover: Option<&'static str>,
+    pub hover: Option<String>,
     pub click: Option<Click>,
 }
 
@@ -172,10 +176,57 @@ fn colored(text: impl Into<String>, color: u32) -> Part {
     Part { color: Some(color), ..part(text) }
 }
 
-fn clickable(mut p: Part, hover: &'static str, click: Click) -> Part {
-    p.hover = Some(hover);
+fn clickable(mut p: Part, hover: impl Into<String>, click: Click) -> Part {
+    p.hover = Some(hover.into());
     p.click = Some(click);
     p
+}
+
+/// The language file's messages, by key (`locale/lang-*.yml`, nested keys joined with dots).
+static LANG: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
+
+/// Reads a language file (squaremap's `locale/lang-en.yml` form). Keys it lacks keep the English text. A message
+/// is MiniMessage there; its colour and click tags are not followed, only its words and placeholders (the colours of
+/// each message stay squaremap's defaults). A file that cannot be read leaves the previous language.
+pub fn set_language(text: &str) -> Result<(), String> {
+    let table = crate::horizon_squaremap::yaml::parse(text)?;
+    *LANG.lock().unwrap() = Some(crate::horizon_squaremap::yaml::flatten(&table));
+    Ok(())
+}
+
+/// Back to the built-in English text.
+pub fn clear_language() {
+    *LANG.lock().unwrap() = None;
+}
+
+/// A message by its key in the language file: the file's text, else `default`, with `<name>` placeholders from
+/// `vars` filled in and every other MiniMessage tag dropped.
+fn tr(key: &str, default: &str, vars: &[(&str, &str)]) -> String {
+    tr_from(LANG.lock().unwrap().as_ref(), key, default, vars)
+}
+
+fn tr_from(lang: Option<&HashMap<String, String>>, key: &str, default: &str, vars: &[(&str, &str)]) -> String {
+    fill(lang.and_then(|m| m.get(key)).map_or(default, String::as_str), vars)
+}
+
+fn fill(template: &str, vars: &[(&str, &str)]) -> String {
+    let mut out = String::new();
+    let mut rest = template;
+    while let Some(open) = rest.find('<') {
+        out.push_str(&rest[..open]);
+        let Some(len) = rest[open..].find('>') else {
+            out.push_str(&rest[open..]);
+            return out;
+        };
+        let name = &rest[open + 1..open + len];
+        match vars.iter().find(|(v, _)| *v == name) {
+            Some((_, value)) => out.push_str(value),
+            None => {} // a colour, click, hover or closing tag
+        }
+        rest = &rest[open + len + 1..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Feedback without the prefix (squaremap's `sendMessage` of a MiniMessage).
@@ -203,28 +254,74 @@ fn invalid_argument(reason: impl Into<String>) -> Line {
 
 /// squaremap's `invalid-syntax` with the usage (after the label).
 fn invalid_syntax(usage: &str) -> Line {
-    error(vec![
-        colored("Invalid command syntax. Correct command syntax is", RED),
-        colored(":", WHITE),
-        part(" "),
-        colored(format!("/{} {usage}", main_label()), GRAY),
-    ])
+    let mut parts = vec![colored("Invalid command syntax. Correct command syntax is", RED), colored(":", WHITE), part(" ")];
+    parts.extend(highlight_special(&format!("/{} {usage}", main_label()), GRAY));
+    error(parts)
 }
+
+/// `Components.highlightSpecialCharacters`: every character that is not a word character, a space or a hyphen in white,
+/// the runs between in `color`.
+fn highlight_special(text: &str, color: u32) -> Vec<Part> {
+    let mut out: Vec<Part> = Vec::new();
+    let mut run = String::new();
+    for c in text.chars() {
+        if c.is_alphanumeric() || c == '_' || c == '-' || c.is_whitespace() {
+            run.push(c);
+        } else {
+            if !run.is_empty() {
+                out.push(colored(std::mem::take(&mut run), color));
+            }
+            out.push(colored(c.to_string(), WHITE));
+        }
+    }
+    if !run.is_empty() {
+        out.push(colored(run, color));
+    }
+    out
+}
+
+/// The subcommands of the bare label, as cloud lists them when the label alone is typed.
+const ROOT_SYNTAX: &str = "<cancelrender|confirm|fullrender|help|hide|link|pauserender|progresslogging|radiusrender|reload|resetmap|show>";
 
 /// squaremap's `command.message.exception.no-permission`, as the player sees it.
 pub fn no_permission() -> Line {
     error(vec![colored(
-        "I'm sorry, but you do not have permission to perform this command.\nPlease contact the server administrators if you believe that this is in error.",
+        tr(
+            "command.message.exception.no-permission",
+            "I'm sorry, but you do not have permission to perform this command.\nPlease contact the server administrators if you believe that this is in error.",
+            &[],
+        ),
         RED,
     )])
 }
 
 fn no_such_world(input: &str) -> Line {
-    invalid_argument(format!("No such world '{input}'"))
+    invalid_argument(tr("command.message.no-such-world", "No such world '<world>'", &[("world", input)]))
 }
 
 fn number_out_of_range(input: &str) -> Line {
-    invalid_argument(format!("'{input}' is not a valid number in the range 1 to 2147483647"))
+    invalid_argument(tr(
+        "command.message.parser-exception.number",
+        "'<input>' is not a valid number in the range <min> to <max>",
+        &[("input", input), ("min", "1"), ("max", "2147483647")],
+    ))
+}
+
+/// The bad `<x> <z>` of `radiusrender`'s centre.
+fn bad_location(input: &str) -> Line {
+    invalid_argument(tr(
+        "command.message.parser-exception.location.invalid_format",
+        "'<input>' is not a valid location. Required format is '<x> <z>'",
+        &[("input", input)],
+    ))
+}
+
+fn mixed_local_absolute() -> Line {
+    invalid_argument(tr(
+        "command.message.parser-exception.location.mixed_local_absolute",
+        "Cannot mix local and absolute coordinates. (either all coordinates use '^' or none do)",
+        &[],
+    ))
 }
 
 fn world_id(w: usize) -> &'static str {
@@ -235,9 +332,12 @@ fn world_id(w: usize) -> &'static str {
 fn refused(e: RenderRefused, w: usize) -> Line {
     let id = world_id(w);
     match e {
-        RenderRefused::InProgress => msg(format!("A render is already in progress on {id}"), RED),
-        RenderRefused::NotInProgress => msg(format!("No renders running for {id}"), RED),
-        RenderRefused::NotEnabled => error(vec![colored(format!("Map is not enabled for world '{id}'"), RED)]),
+        RenderRefused::InProgress => msg(tr("render-in-progress", "A render is already in progress on <world>", &[("world", id)]), RED),
+        RenderRefused::NotInProgress => msg(tr("render-not-in-progress", "No renders running for <world>", &[("world", id)]), RED),
+        RenderRefused::NotEnabled => error(vec![colored(
+            tr("command.message.map-not-enabled-for-world", "Map is not enabled for world '<world>'", &[("world", id)]),
+            RED,
+        )]),
         RenderRefused::NotRunning => msg("The map is not running", RED),
     }
 }
@@ -246,24 +346,114 @@ fn refused(e: RenderRefused, w: usize) -> Line {
 const CONFIRM_FOR: Duration = Duration::from_secs(15);
 static PENDING: Mutex<Vec<(Option<u128>, String, Instant)>> = Mutex::new(Vec::new());
 
-/// squaremap's `/squaremap help` entries: the syntax and the description.
-const HELP: [(&str, &str); 16] = [
-    ("help [query]", "Get help for squaremap commands"),
-    ("confirm", "Confirm a pending command"),
-    ("fullrender [world]", "Starts a full render for the specified world"),
-    ("radiusrender <world> <radius> [center]", "Starts a radius render"),
-    ("cancelrender [world]", "Cancels a render for the specified world"),
-    ("pauserender [world]", "Pauses all renders for the specified world"),
-    ("resetmap <world>", "Resets the map of a specified world"),
-    ("progresslogging", "Prints the current settings for render progress logging"),
-    ("progresslogging toggle", "Toggles render progress logging on or off"),
-    ("progresslogging rate <seconds>", "Sets the interval in seconds for logging render progress"),
-    ("hide [player]", "Hide a player from the map view"),
-    ("hide <player>", "Hide a player from the map view"),
-    ("show [player]", "Show a player on the map view"),
-    ("show <player>", "Show a player on the map view"),
-    ("reload", "Reloads the plugin"),
-    ("link", "Get a link to the map at your current location"),
+/// One argument of a help entry: its name, whether it is optional, the language key of its description and the
+/// English text (empty: none).
+struct HelpArg {
+    name: &'static str,
+    optional: bool,
+    key: &'static str,
+    description: &'static str,
+}
+
+/// One command in squaremap's `/squaremap help`: the syntax after the label, the description's language key and text, and its
+/// arguments. Sorted by syntax, as cloud's help index lists them.
+struct HelpEntry {
+    syntax: &'static str,
+    key: &'static str,
+    description: &'static str,
+    args: &'static [HelpArg],
+}
+
+const OPTIONAL_WORLD: HelpArg = HelpArg {
+    name: "world",
+    optional: true,
+    key: "command.argument.optional-world",
+    description: "Defaults to the players current world if not provided",
+};
+const PLAYER_ARG: HelpArg = HelpArg {
+    name: "player",
+    optional: false,
+    key: "command.argument.optional-player",
+    description: "Defaults to the executing player if unspecified (console must specify a player)",
+};
+const PLAIN_WORLD: HelpArg = HelpArg { name: "world", optional: false, key: "", description: "" };
+
+const HELP: [HelpEntry; 16] = [
+    HelpEntry {
+        syntax: "cancelrender [world]",
+        key: "command.description.cancel-render",
+        description: "Cancels a render for the specified world",
+        args: &[OPTIONAL_WORLD],
+    },
+    HelpEntry { syntax: "confirm", key: "command.description.confirm", description: "Confirm a pending command", args: &[] },
+    HelpEntry {
+        syntax: "fullrender [world]",
+        key: "command.description.full-render",
+        description: "Starts a full render for the specified world",
+        args: &[OPTIONAL_WORLD],
+    },
+    HelpEntry {
+        syntax: "help [query]",
+        key: "command.description.help",
+        description: "Get help for squaremap commands",
+        args: &[HelpArg { name: "query", optional: true, key: "command.argument.help-query", description: "Help Query" }],
+    },
+    HelpEntry { syntax: "hide", key: "command.description.hide", description: "Hide a player from the map view", args: &[] },
+    HelpEntry { syntax: "hide <player>", key: "command.description.hide", description: "Hide a player from the map view", args: &[PLAYER_ARG] },
+    HelpEntry {
+        syntax: "link",
+        key: "command.description.link",
+        description: "Get a link to the map at your current location",
+        args: &[],
+    },
+    HelpEntry {
+        syntax: "pauserender [world]",
+        key: "command.description.pause-render",
+        description: "Pauses all renders for the specified world",
+        args: &[OPTIONAL_WORLD],
+    },
+    HelpEntry {
+        syntax: "progresslogging",
+        key: "command.description.progresslogging.status",
+        description: "Prints the current settings for render progress logging",
+        args: &[],
+    },
+    HelpEntry {
+        syntax: "progresslogging rate <seconds>",
+        key: "command.description.progresslogging.rate",
+        description: "Sets the interval in seconds for logging render progress",
+        args: &[HelpArg { name: "seconds", optional: false, key: "", description: "" }],
+    },
+    HelpEntry {
+        syntax: "progresslogging toggle",
+        key: "command.description.progresslogging.toggle",
+        description: "Toggles render progress logging on or off",
+        args: &[],
+    },
+    HelpEntry {
+        syntax: "radiusrender <world> <radius> [center]",
+        key: "command.description.radius-render",
+        description: "Starts a radius render",
+        args: &[
+            PLAIN_WORLD,
+            HelpArg { name: "radius", optional: false, key: "", description: "" },
+            HelpArg {
+                name: "center",
+                optional: true,
+                key: "command.argument.optional-center",
+                description: "Defaults to (<white>0<gray>,</gray> 0</white>) if unspecified",
+            },
+        ],
+    },
+    HelpEntry { syntax: "reload", key: "command.description.reload", description: "Reloads the plugin", args: &[] },
+    HelpEntry {
+        syntax: "resetmap <world>",
+        key: "command.description.resetmap",
+        description: "Resets the map of a specified world",
+        args: &[PLAIN_WORLD],
+    },
+    HelpEntry { syntax: "show", key: "command.description.show", description: "Show a player on the map view", args: &[] },
+    HelpEntry { syntax: "show <player>", key: "command.description.show", description: "Show a player on the map view", args: &[PLAYER_ARG] },
 ];
 
 /// A level by its identifier (`MapWorldParser`): `minecraft:the_nether`, or `the_nether` in the
@@ -284,12 +474,16 @@ pub fn command(line: &str, sender: &Sender, online: &[(u128, String)]) -> Vec<Li
         return vec![no_permission()];
     }
     match sub.as_str() {
-        "" | "help" => help(&args.join(" ")),
+        // The label alone has no handler: cloud answers with the subcommands it could be followed by.
+        "" => vec![invalid_syntax(ROOT_SYNTAX)],
+        "help" => help(&args.join(" ")),
         "confirm" => confirm(sender, online),
         "fullrender" => match world_arg(args.first().copied(), sender) {
             Err(e) => vec![e],
             Ok(w) => match runtime::start_full_render(w) {
-                Ok(()) if sender.player.is_some() => vec![plain(format!("Started full map render for {}", world_id(w)))],
+                Ok(()) if sender.player.is_some() => {
+                    vec![plain(tr("log.started-full-render", "Started full map render for <world>", &[("world", world_id(w))]))]
+                }
                 Ok(()) => vec![],
                 Err(e) => vec![refused(e, w)],
             },
@@ -298,15 +492,15 @@ pub fn command(line: &str, sender: &Sender, online: &[(u128, String)]) -> Vec<Li
         "cancelrender" => match world_arg(args.first().copied(), sender) {
             Err(e) => vec![e],
             Ok(w) => match runtime::cancel_render(w) {
-                Ok(()) => vec![msg(format!("Render cancelled for {}", world_id(w)), GREEN)],
+                Ok(()) => vec![msg(tr("cancelled-render", "Render cancelled for <world>", &[("world", world_id(w))]), GREEN)],
                 Err(e) => vec![refused(e, w)],
             },
         },
         "pauserender" => match world_arg(args.first().copied(), sender) {
             Err(e) => vec![e],
             Ok(w) => match runtime::toggle_pause(w) {
-                Some(true) => vec![msg(format!("Paused renders for {}", world_id(w)), GREEN)],
-                Some(false) => vec![msg(format!("Unpaused renders for {}", world_id(w)), GREEN)],
+                Some(true) => vec![msg(tr("paused-renders", "Paused renders for <world>", &[("world", world_id(w))]), GREEN)],
+                Some(false) => vec![msg(tr("unpaused-renders", "Unpaused renders for <world>", &[("world", world_id(w))]), GREEN)],
                 None => vec![refused(RenderRefused::NotRunning, w)],
             },
         },
@@ -314,7 +508,10 @@ pub fn command(line: &str, sender: &Sender, online: &[(u128, String)]) -> Vec<Li
         "progresslogging" => progress(args),
         "hide" | "show" => hide_show(sub == "hide", args.first().copied(), sender, online),
         "reload" => match runtime::reload() {
-            Ok(()) => vec![msg(format!("squaremap v{} reloaded", env!("CARGO_PKG_VERSION")), GREEN)],
+            Ok(()) => vec![msg(
+                tr("plugin-reloaded", "<name> v<version> reloaded", &[("name", "squaremap"), ("version", env!("CARGO_PKG_VERSION"))]),
+                GREEN,
+            )],
             Err(e) => vec![msg(e, RED)],
         },
         "link" => vec![link(sender)],
@@ -322,38 +519,139 @@ pub fn command(line: &str, sender: &Sender, online: &[(u128, String)]) -> Vec<Li
     }
 }
 
+/// Commands to a page of the help index (`MinecraftHelp`'s default).
+const HELP_PER_PAGE: usize = 6;
+
+/// A caption of the help (`command.message.help.<key>`), English by default.
+fn caption(key: &str, default: &str) -> String {
+    tr(&format!("command.message.help.{key}"), default, &[])
+}
+
+/// The title bar of the help: the title in the primary colour between dashes.
+fn help_title() -> Line {
+    let bar = "-".repeat(12);
+    feedback(vec![
+        colored(format!("{bar} "), DARK_GRAY),
+        colored(caption("help_title", "squaremap command help"), PRIMARY),
+        colored(format!(" {bar}"), DARK_GRAY),
+    ])
+}
+
+/// `/squaremap help [query]` (cloud's `MinecraftHelp`): a query that is exactly one command's syntax shows it with its
+/// description and arguments; any other query lists the commands whose syntax starts with it, six to a page (a number
+/// ending the query picks the page); no query lists them all.
 fn help(query: &str) -> Vec<Line> {
     let label = main_label();
-    let q = query.trim();
+    let mut words: Vec<&str> = query.split_whitespace().collect();
+    let page = match words.last().and_then(|w| w.parse::<usize>().ok()) {
+        Some(n) => {
+            words.pop();
+            n
+        }
+        None => 1,
+    };
+    let q = words.join(" ");
     let needle = q.to_ascii_lowercase();
-    let found: Vec<&(&str, &str)> = HELP
-        .iter()
-        .filter(|(u, d)| needle.is_empty() || u.contains(needle.as_str()) || d.to_ascii_lowercase().contains(needle.as_str()))
-        .collect();
-    if needle.is_empty() {
-        let mut out = vec![feedback(vec![colored("squaremap command help", PRIMARY)])];
-        out.extend(found.iter().map(|entry| help_entry(&label, entry)));
+    // Exactly one command (no longer syntax continues it): shown in full.
+    let longer = format!("{needle} ");
+    let has_more = HELP.iter().any(|e| e.syntax.to_ascii_lowercase().starts_with(&longer));
+    if let Some(entry) = HELP.iter().find(|e| !needle.is_empty() && e.syntax.eq_ignore_ascii_case(&needle)) {
+        if !has_more {
+            return help_verbose(&label, entry);
+        }
+    }
+    let found: Vec<&HelpEntry> = HELP.iter().filter(|e| e.syntax.to_ascii_lowercase().starts_with(&needle)).collect();
+    let mut out = vec![help_title()];
+    if !needle.is_empty() {
+        if found.is_empty() {
+            out.push(msg(format!("{}: {q}", caption("no_results_for_query", "No results for query")), GRAY));
+            return out;
+        }
+        out.push(msg(format!("{}: {q}", caption("showing_results_for_query", "Showing search results for query")), GRAY));
+    }
+    let pages = found.len().div_ceil(HELP_PER_PAGE).max(1);
+    if page < 1 || page > pages {
+        out.push(msg(
+            tr(
+                "command.message.help.page_out_of_range",
+                "Error: Page <page> is not in range. Must be in range [1, <max_pages>]",
+                &[("page", &page.to_string()), ("max_pages", &pages.to_string())],
+            ),
+            RED,
+        ));
         return out;
     }
-    if found.is_empty() {
-        return vec![msg(format!("No results for query: {q}"), GRAY)];
+    out.push(feedback(vec![colored(format!("{}:", caption("available_commands", "Available Commands")), PRIMARY)]));
+    for entry in found.iter().skip((page - 1) * HELP_PER_PAGE).take(HELP_PER_PAGE) {
+        out.push(help_entry(&label, entry));
     }
-    let mut out = vec![msg(format!("Showing search results for query: {q}"), GRAY)];
-    out.extend(found.iter().map(|entry| help_entry(&label, entry)));
+    if pages > 1 {
+        let base = if q.is_empty() { format!("/{label} help") } else { format!("/{label} help {q}") };
+        let mut footer = Vec::new();
+        if page > 1 {
+            footer.push(clickable(
+                colored("\u{2190}", PRIMARY),
+                caption("click_for_previous_page", "Click for previous page"),
+                Click::Run(format!("{base} {}", page - 1)),
+            ));
+        } else {
+            footer.push(colored("\u{2190}", DARK_GRAY));
+        }
+        footer.push(colored(format!(" {page}/{pages} "), WHITE));
+        if page < pages {
+            footer.push(clickable(
+                colored("\u{2192}", PRIMARY),
+                caption("click_for_next_page", "Click for next page"),
+                Click::Run(format!("{base} {}", page + 1)),
+            ));
+        } else {
+            footer.push(colored("\u{2192}", DARK_GRAY));
+        }
+        out.push(feedback(footer));
+    }
     out
 }
 
-fn help_entry(label: &str, (usage, desc): &(&str, &str)) -> Line {
-    let sub = usage.split_whitespace().next().unwrap_or_default();
-    feedback(vec![
-        clickable(
-            colored(format!("/{label} {usage}"), WHITE),
-            "Click to show help for this command",
-            Click::Run(format!("/{label} help {sub}")),
-        ),
-        part(" - "),
-        colored(*desc, GRAY),
-    ])
+fn help_entry(label: &str, entry: &HelpEntry) -> Line {
+    feedback(vec![clickable(
+        colored(format!("/{label} {}", entry.syntax), WHITE),
+        caption("click_to_show_help", "Click to show help for this command"),
+        Click::Run(format!("/{label} help {}", entry.syntax)),
+    )])
+}
+
+/// One command's help: its syntax, description and arguments.
+fn help_verbose(label: &str, entry: &HelpEntry) -> Vec<Line> {
+    let mut out = vec![help_title()];
+    let mut command = vec![colored(format!("{}: ", caption("command", "Command")), PRIMARY)];
+    command.extend(highlight_special(&format!("/{label} {}", entry.syntax), WHITE));
+    out.push(feedback(command));
+    out.push(feedback(vec![
+        colored(format!("{}: ", caption("description", "Description")), PRIMARY),
+        colored(fill_description(&tr(entry.key, entry.description, &[])), GRAY),
+    ]));
+    if !entry.args.is_empty() {
+        out.push(feedback(vec![colored(format!("{}:", caption("arguments", "Arguments")), PRIMARY)]));
+        for arg in entry.args {
+            let shown = if arg.optional { format!("[{}]", arg.name) } else { format!("<{}>", arg.name) };
+            let description = if arg.key.is_empty() {
+                caption("no_description", "No description")
+            } else {
+                fill_description(&tr(arg.key, arg.description, &[]))
+            };
+            let mut parts = vec![part("  "), colored(shown, WHITE), colored(format!(" - {description}"), GRAY)];
+            if arg.optional {
+                parts.push(colored(format!(" ({})", caption("optional", "Optional")), DARK_GRAY));
+            }
+            out.push(feedback(parts));
+        }
+    }
+    out
+}
+
+/// A description's MiniMessage with its tags dropped.
+fn fill_description(text: &str) -> String {
+    fill(text, &[])
 }
 
 /// The world a command names, or the sender's own world. Errors come as squaremap prints them.
@@ -361,8 +659,16 @@ fn world_arg(arg: Option<&str>, sender: &Sender) -> Result<usize, Line> {
     match (arg, sender.player.as_ref()) {
         (Some(a), _) => parse_world(a).ok_or_else(|| no_such_world(a)),
         (None, Some(p)) => runtime::world_index(&p.world)
-            .ok_or_else(|| error(vec![colored(format!("Map is not enabled for world '{}'", p.world), RED)])),
-        (None, None) => Err(error(vec![colored("You must specify the world when running this command from console", RED)])),
+            .ok_or_else(|| {
+                error(vec![colored(
+                    tr("command.message.map-not-enabled-for-world", "Map is not enabled for world '<world>'", &[("world", &p.world)]),
+                    RED,
+                )])
+            }),
+        (None, None) => Err(error(vec![colored(
+            tr("command.message.console-must-specify-world", "You must specify the world when running this command from console", &[]),
+            RED,
+        )])),
     }
 }
 
@@ -378,6 +684,36 @@ fn coord(s: &str, base: f64) -> Option<i32> {
     }
 }
 
+/// The part of a `^left` / `^forward` local coordinate after the caret: a number, empty for 0.
+fn local_part(s: &str) -> Option<f64> {
+    let rest = s.strip_prefix('^')?;
+    if rest.is_empty() { Some(0.0) } else { rest.parse::<f64>().ok() }
+}
+
+/// The centre of `radiusrender` (`Location2DParser`): `<x> <z>` of numbers or `~` offsets from the sender, or both with
+/// `^`: `^left ^forward` from the sender along their facing (`yaw` in degrees, 0 facing south). Mixing the two forms
+/// is refused, as is anything that is not a number.
+fn center(x: &str, z: &str, base: (f64, f64), yaw: f64) -> Result<[i32; 2], Line> {
+    let local = (x.starts_with('^'), z.starts_with('^'));
+    if local.0 != local.1 {
+        return Err(mixed_local_absolute());
+    }
+    if local.0 {
+        let (Some(left), Some(forward)) = (local_part(x), local_part(z)) else {
+            return Err(bad_location(&format!("{x} {z}")));
+        };
+        let (sin, cos) = yaw.to_radians().sin_cos();
+        // Facing south (yaw 0) forward is +z and left is +x; turning right (yaw +90, west) swings both round.
+        let (fx, fz) = (-sin, cos);
+        let (lx, lz) = (cos, sin);
+        return Ok([(base.0 + left * lx + forward * fx).floor() as i32, (base.1 + left * lz + forward * fz).floor() as i32]);
+    }
+    match (coord(x, base.0), coord(z, base.1)) {
+        (Some(x), Some(z)) => Ok([x, z]),
+        _ => Err(bad_location(&format!("{x} {z}"))),
+    }
+}
+
 fn radius(args: &[&str], sender: &Sender) -> Vec<Line> {
     let (Some(w), Some(r)) = (args.first().copied(), args.get(1).copied()) else {
         return vec![invalid_syntax("radiusrender <world> <radius> [center]")];
@@ -387,17 +723,17 @@ fn radius(args: &[&str], sender: &Sender) -> Vec<Line> {
         Ok(r) if r >= 1 => r,
         _ => return vec![number_out_of_range(r)],
     };
-    let (base_x, base_z) = sender.player.as_ref().map_or((0.0, 0.0), |p| (p.x, p.z));
+    let (base, yaw) = sender.player.as_ref().map_or(((0.0, 0.0), 0.0), |p| ((p.x, p.z), p.yaw));
     let center = match (args.get(2).copied(), args.get(3).copied()) {
-        (Some(x), Some(z)) => match (coord(x, base_x), coord(z, base_z)) {
-            (Some(x), Some(z)) => [x, z],
-            _ => return vec![invalid_argument(format!("'{x} {z}' is not a valid location. Required format is '<x> <z>'"))],
+        (Some(x), Some(z)) => match center(x, z, base, yaw) {
+            Ok(c) => c,
+            Err(line) => return vec![line],
         },
         (None, None) => [0, 0],
         _ => return vec![invalid_syntax("radiusrender <world> <radius> [center]")],
     };
     match runtime::start_radius_render(w, center, r) {
-        Ok(()) => vec![plain(format!("Started radius map render for {}", world_id(w)))],
+        Ok(()) => vec![plain(tr("log.started-radius-render", "Started radius map render for <world>", &[("world", world_id(w))]))],
         Err(e) => vec![refused(e, w)],
     }
 }
@@ -416,8 +752,8 @@ fn reset_request(args: &[&str], sender: &Sender, line: &str) -> Vec<Line> {
     pending.push((who, line.to_owned(), Instant::now()));
     let label = main_label();
     vec![feedback(vec![clickable(
-        colored(format!("Confirmation required. Confirm using /{label} confirm."), RED),
-        "Click to confirm",
+        colored(tr("command.message.confirmation-required", "Confirmation required. Confirm using /<command> confirm.", &[("command", &label)]), RED),
+        tr("click-to-confirm", "Click to confirm", &[]),
         Click::Run(format!("/{label} confirm")),
     )])]
 }
@@ -430,7 +766,7 @@ fn confirm(sender: &Sender, online: &[(u128, String)]) -> Vec<Line> {
         p.iter().position(|(w, _, _)| *w == who).map(|i| p.remove(i).1)
     };
     let Some(line) = pending else {
-        return vec![msg("You don't have any pending commands.", RED)];
+        return vec![msg(tr("command.message.no-pending-commands", "You don't have any pending commands.", &[]), RED)];
     };
     // Only resetmap asks for a confirmation.
     let words: Vec<&str> = line.split_whitespace().collect();
@@ -438,7 +774,7 @@ fn confirm(sender: &Sender, online: &[(u128, String)]) -> Vec<Line> {
         return command(&line, sender, online);
     };
     match runtime::reset_map(w) {
-        Ok(()) => vec![msg(format!("Successfully reset map for {}", world_id(w)), GREEN)],
+        Ok(()) => vec![msg(tr("successfully-reset-map", "Successfully reset map for <world>", &[("world", world_id(w))]), GREEN)],
         Err(e) => vec![msg(e, RED)],
     }
 }
@@ -454,7 +790,7 @@ fn progress(args: &[&str]) -> Vec<Line> {
             };
             vec![feedback(vec![
                 part("Render progress logging enabled: "),
-                clickable(colored(symbol, color), "Click to toggle", Click::Run(format!("/{label} progresslogging toggle"))),
+                clickable(colored(symbol, color), tr("click-to-toggle", "Click to toggle", &[]), Click::Run(format!("/{label} progresslogging toggle"))),
                 part(", interval: "),
                 colored(PROGRESS_INTERVAL.load(Ordering::Relaxed).to_string(), GREEN),
                 part(" seconds"),
@@ -465,11 +801,15 @@ fn progress(args: &[&str]) -> Vec<Line> {
             PROGRESS_LOGGING.store(now, Ordering::Relaxed);
             runtime::restart_progress_logging();
             let text = if now {
-                "Render progress logging has been enabled."
+                tr("command.message.progresslogging.enabled", "Render progress logging has been enabled.", &[])
             } else {
-                "Render progress logging has been disabled."
+                tr("command.message.progresslogging.disabled", "Render progress logging has been disabled.", &[])
             };
-            vec![feedback(vec![clickable(colored(text, GREEN), "Click to toggle", Click::Run(format!("/{label} progresslogging toggle")))])]
+            vec![feedback(vec![clickable(
+                colored(text, GREEN),
+                tr("click-to-toggle", "Click to toggle", &[]),
+                Click::Run(format!("/{label} progresslogging toggle")),
+            )])]
         }
         Some("rate") => match args.get(1).copied() {
             None => vec![invalid_syntax("progresslogging rate <seconds>")],
@@ -496,21 +836,24 @@ fn hide_show(hide: bool, target: Option<&str>, sender: &Sender, online: &[(u128,
     };
     let Some((uuid, name)) = found else {
         return vec![match target {
-            None => error(vec![colored("You must specify a target player when running this command from console", RED)]),
+            None => error(vec![colored(
+                tr("command.message.console-must-specify-player", "You must specify a target player when running this command from console", &[]),
+                RED,
+            )]),
             Some(n) => invalid_argument(format!("No player named '{n}' is online")),
         }];
     };
     let hidden = crate::horizon_squaremap::api::player_hidden(uuid);
     match (hide, hidden) {
-        (true, true) => vec![msg(format!("{name} is already hidden from map"), RED)],
+        (true, true) => vec![msg(tr("command.hide.already-hidden", "<player> is already hidden from map", &[("player", &name)]), RED)],
         (true, false) => {
             crate::horizon_squaremap::api::hide_player(uuid, true);
-            vec![msg(format!("{name} is now hidden from map"), GREEN)]
+            vec![msg(tr("command.hide.hidden", "<player> is now hidden from map", &[("player", &name)]), GREEN)]
         }
-        (false, false) => vec![msg(format!("{name} is not hidden from map"), RED)],
+        (false, false) => vec![msg(tr("command.show.not-hidden", "<player> is not hidden from map", &[("player", &name)]), RED)],
         (false, true) => {
             crate::horizon_squaremap::api::show_player(uuid, true);
-            vec![msg(format!("{name} is no longer hidden from map"), GREEN)]
+            vec![msg(tr("command.show.shown", "<player> is no longer hidden from map", &[("player", &name)]), GREEN)]
         }
     }
 }
@@ -586,7 +929,7 @@ mod tests {
 
     fn player(level: u8) -> Sender {
         Sender {
-            player: Some(SenderPlayer { uuid: 7, name: "Alex".into(), world: "minecraft:the_nether".into(), x: 100.7, z: -3.2 }),
+            player: Some(SenderPlayer { uuid: 7, name: "Alex".into(), world: "minecraft:the_nether".into(), x: 100.7, z: -3.2, yaw: 0.0 }),
             permission: level,
             others: false,
         }
@@ -646,8 +989,14 @@ mod tests {
             texts(&command("squaremap fullrender", &player(0), &[])),
             ["I'm sorry, but you do not have permission to perform this command.\nPlease contact the server administrators if you believe that this is in error."]
         );
-        assert_eq!(texts(&command("squaremap", &player(0), &[]))[0], "squaremap command help");
-        assert_eq!(command("map help hide", &player(2), &[]).len(), 3);
+        // The label alone has no handler: the answer lists what could follow it.
+        assert_eq!(
+            texts(&command("squaremap", &player(0), &[])),
+            ["Invalid command syntax. Correct command syntax is: /squaremap <cancelrender|confirm|fullrender|help|hide|link|pauserender|progresslogging|radiusrender|reload|resetmap|show>"]
+        );
+        // `help link` is exactly one command: its title, syntax and description (no arguments); `help hide` is two.
+        assert_eq!(command("map help link", &player(2), &[]).len(), 3);
+        assert_eq!(command("map help hide", &player(2), &[]).len(), 5);
         assert_eq!(texts(&command("squaremap fullrender", &console(), &[])), ["You must specify the world when running this command from console"]);
         assert_eq!(texts(&command("squaremap cancelrender nether", &console(), &[])), ["Invalid command argument: No such world 'nether'"]);
         assert_eq!(
@@ -659,6 +1008,60 @@ mod tests {
             ["Click to open map: http://localhost:8080?uuid=00000000000000000000000000000007"]
         );
         assert_eq!(texts(&command("squaremap confirm", &player(2), &[])), ["You don't have any pending commands."]);
+    }
+
+    #[test]
+    fn help_lists_six_to_a_page_and_shows_one_command_in_full() {
+        let first = texts(&help(""));
+        assert_eq!(first.len(), 9, "{first:?}");
+        assert_eq!(first[0], "------------ squaremap command help ------------");
+        assert_eq!(first[1], "Available Commands:");
+        assert_eq!(first[2], "/squaremap cancelrender [world]");
+        assert_eq!(first[7], "/squaremap hide <player>");
+        assert_eq!(first[8], "\u{2190} 1/3 \u{2192}");
+        let last = texts(&help("3"));
+        assert_eq!(last[2], "/squaremap reload");
+        assert_eq!(last[last.len() - 1], "\u{2190} 3/3 \u{2192}");
+        assert!(texts(&help("9"))[1].starts_with("Error: Page 9 is not in range"));
+        let found = texts(&help("progresslogging"));
+        assert_eq!(found[1], "Showing search results for query: progresslogging");
+        assert_eq!(found.len(), 6);
+        assert_eq!(texts(&help("nothing"))[1], "No results for query: nothing");
+        let one = texts(&help("hide <player>"));
+        assert_eq!(one[1], "Command: /squaremap hide <player>");
+        assert_eq!(one[2], "Description: Hide a player from the map view");
+        assert_eq!(one[3], "Arguments:");
+        assert_eq!(one[4], "  <player> - Defaults to the executing player if unspecified (console must specify a player)");
+        let center = texts(&help("radiusrender <world> <radius> [center]"));
+        assert_eq!(center[6], "  [center] - Defaults to (0, 0) if unspecified (Optional)");
+        assert_eq!(center[4], "  <world> - No description");
+    }
+
+    #[test]
+    fn language_file_replaces_words_and_fills_placeholders() {
+        assert_eq!(fill("<red>No renders running for <world></red>", &[("world", "minecraft:the_end")]), "No renders running for minecraft:the_end");
+        assert_eq!(fill("a < b", &[]), "a < b");
+        let file = "render-not-in-progress: '<red>Kein Render fuer <world>'\ncommand:\n  message:\n    no-pending-commands: Nichts ausstehend\n";
+        let lang = crate::horizon_squaremap::yaml::flatten(&crate::horizon_squaremap::yaml::parse(file).unwrap());
+        assert_eq!(tr_from(Some(&lang), "render-not-in-progress", "No renders running for <world>", &[("world", "x")]), "Kein Render fuer x");
+        assert_eq!(tr_from(Some(&lang), "command.message.no-pending-commands", "You don't have any pending commands.", &[]), "Nichts ausstehend");
+        // A key the file lacks keeps the English text.
+        assert_eq!(tr_from(Some(&lang), "cancelled-render", "Render cancelled for <world>", &[("world", "x")]), "Render cancelled for x");
+        assert_eq!(tr_from(None, "cancelled-render", "Render cancelled for <world>", &[("world", "y")]), "Render cancelled for y");
+    }
+
+    #[test]
+    fn center_reads_numbers_relative_and_local_coordinates() {
+        assert_eq!(center("10", "-3.5", (0.0, 0.0), 0.0).ok(), Some([10, -4]));
+        assert_eq!(center("~", "~5", (100.7, 20.2), 0.0).ok(), Some([100, 25]));
+        // Facing south (yaw 0): forward is +z, left is +x.
+        assert_eq!(center("^", "^10", (0.5, 0.5), 0.0).ok(), Some([0, 10]));
+        assert_eq!(center("^3", "^", (0.5, 0.5), 0.0).ok(), Some([3, 0]));
+        // Facing west (yaw 90): forward is -x, left is +z.
+        assert_eq!(center("^", "^10", (0.5, 0.5), 90.0).ok(), Some([-10, 0]));
+        assert_eq!(center("^5", "^", (0.5, 0.5), 90.0).ok(), Some([0, 5]));
+        assert_eq!(center("^1", "2", (0.0, 0.0), 0.0).err().map(|l| l.text()), Some("Invalid command argument: Cannot mix local and absolute coordinates. (either all coordinates use '^' or none do)".into()));
+        assert_eq!(center("a", "2", (0.0, 0.0), 0.0).err().map(|l| l.text()), Some("Invalid command argument: 'a 2' is not a valid location. Required format is '<x> <z>'".into()));
     }
 
     #[test]

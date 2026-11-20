@@ -26,7 +26,7 @@ This is a native trait mod: `horizon-mod.toml`, a `Cargo.toml` that depends on `
 - **What gets rendered.** Newly generated chunks (squaremap's `ChunkPopulateEvent`) and
   chunks whose blocks change (`Level.setBlock`), in batches every
   `render.background.interval-seconds`, at most `max-chunks-per-interval` per batch.
-  A changed chunk that unloads before its turn is rendered when it loads again.
+  A changed chunk is redrawn from the region files: right away when it unloaded, else after the next world save (the changed blocks are not on disk before).
 - **Full and radius renders** (`/squaremap fullrender`, `radiusrender`): the chunks already
   saved in the world's region files (`dimensions/<ns>/<level>/region/r.<x>.<z>.mca`) are
   read and drawn on a thread of their own, region by region in squaremap's spiral order;
@@ -74,8 +74,8 @@ The web folder defaults to `squaremap/web` inside the world folder.
 
 ## Not ported
 
-- The update checker and language files (English messages are built in, with squaremap's
-  colours, hovers and clicks; the help layout and some wording are guesses, see the Known gaps section).
+- The update checker (English messages are built in, with squaremap's colours, hovers and clicks; a language
+  file replaces the wording, see the Known gaps section).
 - `progresslogging toggle|rate` change the running server only; squaremap writes them
   back to its config.
 - Region files are read for chunks compressed with gzip, zlib or not at all (vanilla's
@@ -112,12 +112,12 @@ horizon-launcher native-build <path to this folder> --server-output <dir> --vers
 What does not work yet on arismoko/horizon (each is marked `TODO(arismoko-api: ...)` or `HMOD-GAP(...)` in `src/lib.rs`):
 
 - The web renderer starts (the block-state and biome tables are built from the resource folder and the host); with the tables missing the commands still answer and the config is read, but no tiles are drawn.
-- Loaded chunks are not snapshotted (no chunk snapshot API), and the glue does not yet hand disk views of due chunks to the render thread: the live map does not redraw changed chunks in the background; `fullrender` and `radiusrender` draw what the region files hold.
+- Loaded chunks are not snapshotted (no chunk snapshot API): a changed chunk that is still loaded is redrawn from the region files after the next world save (one that unloaded, at once), so the live map follows the save, not the block change.
 - Only the three vanilla dimensions are mapped (`minecraft:overworld`, `the_nether`, `the_end`); other levels are not listed, rendered or accepted by `fullrender`/`resetmap`.
 - Display names are the real names (no nickname getter on Horizon).
 - The `map-invisibility-equipment` hide rule checks the vanilla tag's one entry (carved pumpkin): there is no item tag query.
-- Configuration is `config/squaremap-server.toml` (TOML): the original `config.yml`, `advanced.yml` and language files are not read, so messages are fixed English text, and the full and radius render settings (workers, limits) are not read.
-- `/squaremap help` prints a flat list (not cloud's paged help), the bare `/squaremap` prints it too (the original answers with its invalid-syntax line), `radiusrender` takes two plain coordinates (no `~`/`^`) and `hide`/`show <player>` take a name (no selector).
+- Configuration is `config/squaremap-server.toml` (TOML); `plugins/squaremap/config.yml` and `advanced.yml` are read over it when present, and `locale/lang-*.yml` (`settings.language-file`) replaces the command messages (wording and placeholders; MiniMessage colours and click tags are not followed). The full and radius render settings (workers, limits) are not read.
+- `/squaremap help` follows cloud's paged help from memory (title bar and page arrows may differ in detail); `hide`/`show <player>` use Horizon's player argument, so selector errors are the engine's own wording.
 - Region files compressed with LZ4 are skipped; the swamp grass noise of chunks read from disk is approximated.
 
 ## Licence

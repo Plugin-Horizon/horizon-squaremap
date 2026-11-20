@@ -18,6 +18,8 @@ pub struct Config {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
 pub struct Settings {
+    /// The language file under `plugins/squaremap/locale/` (`settings.language-file`).
+    pub language_file: String,
     pub web_address: String,
     pub web_directory: WebDirectory,
     pub internal_webserver: Webserver,
@@ -268,6 +270,7 @@ impl Default for Config {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            language_file: "lang-en.yml".into(),
             web_address: "http://localhost:8080".into(),
             web_directory: WebDirectory { path: "squaremap/web".into(), auto_update: true },
             internal_webserver: Webserver::default(),
@@ -493,6 +496,16 @@ impl Default for Hide {
 impl Config {
     pub fn parse(text: &str) -> Result<Self, String> {
         toml::from_str(text).map_err(|e| e.to_string())
+    }
+
+    /// The TOML text with squaremap's own `config.yml` and `advanced.yml` (when the server has them) laid over it, in
+    /// that order: a key the YAML files set wins.
+    pub fn parse_layers(text: &str, yaml: &[String]) -> Result<Self, String> {
+        let mut table: toml::Table = toml::from_str(text).map_err(|e| e.to_string())?;
+        for layer in yaml {
+            crate::horizon_squaremap::yaml::overlay(&mut table, &crate::horizon_squaremap::yaml::parse(layer)?);
+        }
+        toml::Value::Table(table).try_into().map_err(|e: toml::de::Error| e.to_string())
     }
 
     /// `world-settings.default` with the world's own table merged over it.

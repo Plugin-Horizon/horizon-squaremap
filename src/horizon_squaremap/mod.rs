@@ -19,6 +19,7 @@ pub mod tables;
 pub mod vanilla;
 pub mod visibility;
 pub mod web;
+pub mod yaml;
 
 pub use json::Player;
 pub use runtime::*;

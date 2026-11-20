@@ -19,10 +19,10 @@ use mod_api::{
     NodeDefault,
     PermissionGatherNodesEvent, PermissionLevel, PermissionNode, PermissionValueType, PlayerCommandEvent,
     RegisterCommandsEvent, RegisterConfigsEvent, RunModCommandEvent, ServerHost, ServerStartedEvent,
-    ServerStoppingEvent, ServerTickEvent, ServerTickPhase, Suggestion, TabCompleteEvent, Text,
+    ServerStoppingEvent, ServerTickEvent, ServerTickPhase, Suggestion, TabCompleteEvent, Text, WorldSavedEvent,
 };
 use mod_api::text::{TextClick, TextHover, TextStyle};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const ID: &str = "squaremap";
 
@@ -50,6 +50,37 @@ const NODES: [&str; 13] = [
 /// A Boolean permission node named `name`, as the map's commands ask it.
 fn node(name: &str) -> PermissionNode {
     PermissionNode::new(name, PermissionValueType::Boolean)
+}
+
+/// squaremap's own data folder: its `config.yml`, `advanced.yml` and `locale/lang-*.yml` are read from there when the
+/// server has them (a server moved over from Paper keeps its files).
+const DATA: &str = "plugins/squaremap";
+
+/// `config.yml`, then `advanced.yml`, laid over the TOML config (`sm::set_yaml_layers`).
+fn read_yaml_layers() -> Vec<String> {
+    ["config.yml", "advanced.yml"].iter().filter_map(|f| std::fs::read_to_string(Path::new(DATA).join(f)).ok()).collect()
+}
+
+/// The language file `settings.language-file` names, from `locale/` (its file name only); none leaves the English text.
+fn load_language() {
+    let name = sm::language_file();
+    let file = Path::new(&name).file_name().map(|n| n.to_owned());
+    let text = file.and_then(|f| std::fs::read_to_string(Path::new(DATA).join("locale").join(f)).ok());
+    match text {
+        Some(text) => {
+            if let Err(e) = sm::commands::set_language(&text) {
+                log(&format!("language file {name} not read: {e}"));
+            }
+        }
+        None => sm::commands::clear_language(),
+    }
+}
+
+/// The TOML config text with squaremap's YAML files laid over it, and the language file.
+fn apply_config(text: &str) {
+    sm::set_yaml_layers(read_yaml_layers());
+    sm::config_loaded(text);
+    load_language();
 }
 
 fn log(line: &str) {
@@ -272,7 +303,7 @@ fn line_text(line: &sm::commands::Line) -> Text {
             sm::commands::Click::Run(command) => TextClick::RunCommand(command.clone()),
             sm::commands::Click::Open(url) => TextClick::OpenUrl(url.clone()),
         });
-        text = text.append(styled(&part.text, part.color, click, part.hover));
+        text = text.append(styled(&part.text, part.color, click, part.hover.as_deref()));
     }
     text
 }
@@ -289,13 +320,13 @@ impl Hooks for Mod {
 
     fn config_loading(&self, _: HostSide, event: &mut ConfigLoadingEvent<'_>) {
         if event.config.mod_id == ID {
-            sm::config_loaded(&event.config.text);
+            apply_config(&event.config.text);
         }
     }
 
     fn config_reloading(&self, _: HostSide, event: &mut ConfigReloadingEvent<'_>) {
         if event.config.mod_id == ID {
-            sm::config_loaded(&event.config.text);
+            apply_config(&event.config.text);
         }
     }
 
@@ -322,10 +353,11 @@ impl Hooks for Mod {
         }
         for dimension in DIMENSIONS {
             let Some(w) = sm::world_index(dimension) else { continue };
-            // TODO(arismoko-api: chunk_snapshot): loaded chunks are not snapshotted. Due chunks are
-            // handed to the core as "not loaded", so they are drawn from the region files instead.
+            // TODO(arismoko-api: chunk_snapshot): loaded chunks are not snapshotted. A changed chunk that is still
+            // loaded is drawn from the region files once the next world save has written it (`world_saved`); one
+            // that was unloaded meanwhile is drawn from them at once.
             for (cx, cz) in sm::due_chunks(w) {
-                sm::not_loaded(w, cx, cz);
+                sm::due_chunk(w, cx, cz);
             }
             if sm::markers_due(w) {
                 if let Some((border, spawn)) = level_border(host, dimension) {
@@ -336,6 +368,11 @@ impl Hooks for Mod {
         if sm::players_due() {
             publish_players(&*host);
         }
+    }
+
+    /// A world save wrote the loaded chunks to the region files: the changed ones that waited for it are drawn.
+    fn world_saved(&self, _: &mut dyn ServerHost, _: &mut WorldSavedEvent) {
+        sm::world_saved();
     }
 
     fn chunk_load(&self, _: &mut dyn ServerHost, e: &mut ChunkLoadEvent<'_>) {
@@ -432,6 +469,7 @@ impl Hooks for Mod {
                         world: world.to_string(),
                         x: at[0],
                         z: at[2],
+                        yaw: player.entity().rotation(&*host).map_or(0.0, |r| f64::from(r[0])),
                     }),
                     permission: op,
                     others,
@@ -443,6 +481,10 @@ impl Hooks for Mod {
             _ => return Flow::Continue,
         };
         let lines = sm::commands::command(&line, &sender, &online(&*host));
+        if line.split_whitespace().nth(1).is_some_and(|w| w.eq_ignore_ascii_case("reload")) {
+            // `reload` also reads the language file again.
+            load_language();
+        }
         for l in &lines {
             let _ = host.commands().feedback(line_text(l));
         }
