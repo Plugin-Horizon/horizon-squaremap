@@ -9,21 +9,76 @@
 //!
 //! Config: `config/squaremap-server.toml` (registered as a Server config; a world's
 //! `serverconfig/squaremap-server.toml` wins). The web server binds 127.0.0.1 by default.
+
+pub mod horizon_squaremap;
 use horizon_squaremap as sm;
 use mod_api::{
     BlockChangedEvent, BlockMetadata, ChunkLoadEvent, ChunkUnloadEvent, Command, CommandArgumentValue, CommandSource,
     HostBlockStates,
-    Config, ConfigKind, ConfigLoadingEvent, ConfigReloadingEvent, Flow, HostSide, Hooks, LivingRef, PlayerCommandEvent,
-    RegisterCommandsEvent, RegisterConfigsEvent, RunModCommandEvent, ServerHost, ServerStartedEvent,
-    ServerStoppingEvent, ServerTickEvent, ServerTickPhase, Suggestion, TabCompleteEvent, Text,
+    Config, ConfigKind, ConfigLoadingEvent, ConfigReloadingEvent, EquipmentSlot, Flow, HostSide, Hooks, Identifier,
+    LevelLoadEvent, LevelUnloadEvent, LivingRef, NodeDefault, RegistryEntry,
+    PermissionGatherNodesEvent, PermissionLevel, PermissionNode, PermissionValueType, PlayerCommandEvent,
+    RegisterCommandsEvent, RegisterNodeCommandsEvent, RegisterConfigsEvent, RunModCommandEvent, ServerHost, ServerStartedEvent,
+    ServerStoppingEvent, ServerTickEvent, ServerTickPhase, Suggestion, TabCompleteEvent, Text, WorldSavedEvent,
 };
 use mod_api::text::{TextClick, TextHover, TextStyle};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const ID: &str = "squaremap";
 
-/// The dimensions squaremap draws, by their registry ids.
-const DIMENSIONS: [&str; 3] = ["minecraft:overworld", "minecraft:the_nether", "minecraft:the_end"];
+/// Every permission node the map checks: the subcommands' (`squaremap.command.<sub>`, the ones
+/// `commands::usages` lists) and the two `.others` nodes. Declared in `permission_gather_nodes`.
+const NODES: [&str; 13] = [
+    "squaremap.command.help",
+    "squaremap.command.cancelrender",
+    "squaremap.command.fullrender",
+    "squaremap.command.pauserender",
+    "squaremap.command.radiusrender",
+    "squaremap.command.resetmap",
+    "squaremap.command.progresslogging",
+    "squaremap.command.hide",
+    "squaremap.command.show",
+    "squaremap.command.reload",
+    "squaremap.command.link",
+    "squaremap.command.hide.others",
+    "squaremap.command.show.others",
+];
+
+/// A Boolean permission node named `name`, as the map's commands ask it.
+fn node(name: &str) -> PermissionNode {
+    PermissionNode::new(name, PermissionValueType::Boolean)
+}
+
+/// squaremap's own data folder: its `config.yml`, `advanced.yml` and `locale/lang-*.yml` are read from there when the
+/// server has them (a server moved over from Paper keeps its files).
+const DATA: &str = "plugins/squaremap";
+
+/// `config.yml`, then `advanced.yml`, laid over the TOML config (`sm::set_yaml_layers`).
+fn read_yaml_layers() -> Vec<String> {
+    ["config.yml", "advanced.yml"].iter().filter_map(|f| std::fs::read_to_string(Path::new(DATA).join(f)).ok()).collect()
+}
+
+/// The language file `settings.language-file` names, from `locale/` (its file name only); none leaves the English text.
+fn load_language() {
+    let name = sm::language_file();
+    let file = Path::new(&name).file_name().map(|n| n.to_owned());
+    let text = file.and_then(|f| std::fs::read_to_string(Path::new(DATA).join("locale").join(f)).ok());
+    match text {
+        Some(text) => {
+            if let Err(e) = sm::commands::set_language(&text) {
+                log(&format!("language file {name} not read: {e}"));
+            }
+        }
+        None => sm::commands::clear_language(),
+    }
+}
+
+/// The TOML config text with squaremap's YAML files laid over it, and the language file.
+fn apply_config(text: &str) {
+    sm::set_yaml_layers(read_yaml_layers());
+    sm::config_loaded(text);
+    load_language();
+}
 
 fn log(line: &str) {
     eprintln!("[squaremap] {line}");
@@ -129,15 +184,69 @@ fn render_tables(host: &dyn ServerHost) -> Option<(Vec<sm::RawState>, Vec<sm::Ra
     Some((states, biomes, sm::WorldEnv::plain()))
 }
 
-/// The border of a dimension's level, when it is loaded.
-fn level_border(host: &mut dyn ServerHost, dimension: &str) -> Option<[f64; 4]> {
+/// The border of a dimension's level and the world spawn column (`LevelData.getRespawnData`, one spawn
+/// for every level), when the level is loaded.
+fn level_border(host: &mut dyn ServerHost, dimension: &str) -> Option<([f64; 4], Option<[i32; 2]>)> {
     let level = host.level(dimension)?;
-    level.world_border(&*host)
+    let border = level.world_border(&*host)?;
+    let spawn = level.respawn_data(&*host).map(|r| [r.pos[0], r.pos[2]]);
+    Some((border, spawn))
 }
 
-/// The players squaremap draws. Spectators are left out with the `spectators` hide rule.
-// TODO(arismoko-api: living_effects): the `invisible` hide rule (invisibility effect) is not applied.
-// TODO(arismoko-api: item_in_tag): the `map-invisibility-equipment` hide rule is not applied.
+/// The ids of the open levels from the host (`Levels::list_levels`), with `add` in it (a level that just opened) and
+/// without `remove` (one that just closed).
+fn open_level_ids(host: &dyn ServerHost, add: Option<&str>, remove: Option<&str>) -> Vec<String> {
+    let mut ids: Vec<String> = host.levels().list_levels().into_iter().map(|l| l.dimension_id().to_owned()).collect();
+    if let Some(a) = add {
+        if !ids.iter().any(|i| i == a) {
+            ids.push(a.to_owned());
+        }
+    }
+    if let Some(r) = remove {
+        ids.retain(|i| i != r);
+    }
+    ids
+}
+
+/// The map's level registry follows the open levels: their ids, their height ranges (`LevelRef.height`), and the
+/// renders a stop interrupted resume. Called at start and whenever a level loads or unloads.
+fn sync_levels(host: &mut dyn ServerHost, add: Option<&str>, remove: Option<&str>) {
+    let ids = open_level_ids(&*host, add, remove);
+    sm::set_open_levels(&ids);
+    for id in &ids {
+        let (Some(w), Some(level)) = (sm::world_index(id), host.level(id)) else { continue };
+        if let Some((min_y, height)) = level.height(&*host) {
+            sm::level_shape(w, min_y, min_y + height, id.as_str() == "minecraft:the_nether");
+        }
+    }
+    sm::resume_renders();
+}
+
+/// The item tag `minecraft:map_invisibility_equipment` (`ItemTags.MAP_INVISIBILITY_EQUIPMENT`).
+const MAP_INVISIBILITY_TAG: &str = "minecraft:map_invisibility_equipment";
+
+/// The tag's one vanilla entry: the answer when the host gives none.
+const MAP_INVISIBILITY_FALLBACK: &str = "minecraft:carved_pumpkin";
+
+/// Whether the item `id` is in `minecraft:map_invisibility_equipment`, read from the host's item tags
+/// (`registry_entry_in_tag`, as veinminer's item tag check); the vanilla entry answers when the host has none.
+fn is_map_invisibility_item(host: &dyn ServerHost, id: &str) -> bool {
+    let fallback = id == MAP_INVISIBILITY_FALLBACK;
+    let (Ok(registry), Ok(entry)) = (Identifier::parse("minecraft:item"), Identifier::parse(id)) else {
+        return fallback;
+    };
+    host.registry_entry_in_tag(&RegistryEntry::new(registry, entry), MAP_INVISIBILITY_TAG).unwrap_or(fallback)
+}
+
+/// `MapItemSavedData.hasMapInvisibilityItemEquipped`: an item of the tag in an armour or body slot.
+fn has_map_invisibility_equipment(host: &dyn ServerHost, living: LivingRef) -> bool {
+    [EquipmentSlot::Feet, EquipmentSlot::Legs, EquipmentSlot::Chest, EquipmentSlot::Head, EquipmentSlot::Body, EquipmentSlot::Saddle]
+        .into_iter()
+        .any(|slot| living.equipment(host, slot).is_some_and(|stack| is_map_invisibility_item(host, &stack.item().id(host))))
+}
+
+/// The players squaremap draws, less the ones a level's `player-tracker.hide` rules leave out:
+/// spectators, invisible players (the invisibility effect) and map invisibility equipment.
 fn publish_players(host: &dyn ServerHost) {
     let mut list = Vec::new();
     for p in host.players().server_players() {
@@ -147,11 +256,18 @@ fn publish_players(host: &dyn ServerHost) {
             continue;
         };
         let world = world.to_string();
-        if sm::hide_rules(&world).spectators && p.is_spectator(host) == Some(true) {
+        let rules = sm::hide_rules(&world);
+        if rules.spectators && p.is_spectator(host) == Some(true) {
             continue;
         }
         let entity = p.entity();
         let living = LivingRef::new(entity);
+        if rules.invisible && entity.is_invisible(host) == Some(true) {
+            continue;
+        }
+        if rules.map_invisibility_equipment && has_map_invisibility_equipment(host, living) {
+            continue;
+        }
         list.push(sm::Player {
             uuid: p.uuid(),
             name,
@@ -161,8 +277,8 @@ fn publish_players(host: &dyn ServerHost) {
             health: living.health(host).unwrap_or(0.0),
             // `Attributes.ARMOR` with every modifier, as the game answers it.
             armor: living.attribute_value(host, "minecraft:armor").map(|v| v.floor() as i32),
-            // The nickname, where one is set: the closest arismoko has to the display name.
-            display_name: p.nickname(host).flatten(),
+            // HMOD-GAP(nickname): Horizon main can set a nickname but has no getter, so the map shows the real name.
+            display_name: None,
         });
     }
     sm::publish_players(&list, max_players(host));
@@ -221,7 +337,7 @@ fn line_text(line: &sm::commands::Line) -> Text {
             sm::commands::Click::Run(command) => TextClick::RunCommand(command.clone()),
             sm::commands::Click::Open(url) => TextClick::OpenUrl(url.clone()),
         });
-        text = text.append(styled(&part.text, part.color, click, part.hover));
+        text = text.append(styled(&part.text, part.color, click, part.hover.as_deref()));
     }
     text
 }
@@ -238,17 +354,18 @@ impl Hooks for Mod {
 
     fn config_loading(&self, _: HostSide, event: &mut ConfigLoadingEvent<'_>) {
         if event.config.mod_id == ID {
-            sm::config_loaded(&event.config.text);
+            apply_config(&event.config.text);
         }
     }
 
     fn config_reloading(&self, _: HostSide, event: &mut ConfigReloadingEvent<'_>) {
         if event.config.mod_id == ID {
-            sm::config_loaded(&event.config.text);
+            apply_config(&event.config.text);
         }
     }
 
     fn server_started(&self, host: &mut dyn ServerHost, _: &mut ServerStartedEvent) {
+        sync_levels(host, None, None);
         match render_tables(&*host) {
             Some((states, biomes, env)) => match sm::start(&level_dir(), states, biomes, env) {
                 Ok(()) => log("map started"),
@@ -269,23 +386,41 @@ impl Hooks for Mod {
         if !matches!(event.phase, ServerTickPhase::ServerTickEnd { world_running: true, .. }) || !sm::running() {
             return;
         }
-        for dimension in DIMENSIONS {
-            let Some(w) = sm::world_index(dimension) else { continue };
-            // TODO(arismoko-api: chunk_snapshot): loaded chunks are not snapshotted. Due chunks are
-            // handed to the core as "not loaded", so they are drawn from the region files instead.
+        for (w, dimension) in sm::open_levels() {
+            // A level whose map is disabled is not drawn and publishes nothing.
+            if !sm::world_enabled(w) {
+                continue;
+            }
+            // TODO(arismoko-api: chunk_snapshot): loaded chunks are not snapshotted. A changed chunk that is still
+            // loaded is drawn from the region files once the next world save has written it (`world_saved`); one
+            // that was unloaded meanwhile is drawn from them at once.
             for (cx, cz) in sm::due_chunks(w) {
-                sm::not_loaded(w, cx, cz);
+                sm::due_chunk(w, cx, cz);
             }
             if sm::markers_due(w) {
-                // TODO(arismoko-api: level_world_spawn): no spawn marker (`None`).
-                if let Some(border) = level_border(host, dimension) {
-                    sm::publish_markers(w, None, border);
+                if let Some((border, spawn)) = level_border(host, &dimension) {
+                    sm::publish_markers(w, spawn, border);
                 }
             }
         }
         if sm::players_due() {
             publish_players(&*host);
         }
+    }
+
+    /// A world save wrote the loaded chunks to the region files: the changed ones that waited for it are drawn.
+    fn world_saved(&self, _: &mut dyn ServerHost, _: &mut WorldSavedEvent) {
+        sm::world_saved();
+    }
+
+    /// A level opened (before its first chunk): it joins the registry, and its map is set up if it is enabled.
+    fn level_load(&self, host: &mut dyn ServerHost, event: &mut LevelLoadEvent<'_>) {
+        sync_levels(host, Some(event.dimension), None);
+    }
+
+    /// A level closed after its last save: it leaves the registry (its index and queued work stay).
+    fn level_unload(&self, host: &mut dyn ServerHost, event: &mut LevelUnloadEvent<'_>) {
+        sync_levels(host, None, Some(event.dimension));
     }
 
     fn chunk_load(&self, _: &mut dyn ServerHost, e: &mut ChunkLoadEvent<'_>) {
@@ -306,17 +441,30 @@ impl Hooks for Mod {
         }
     }
 
+    fn permission_gather_nodes(&self, event: &mut PermissionGatherNodesEvent<'_>) {
+        let level = NodeDefault::Level(PermissionLevel::from_level(i32::from(sm::commands::OP_LEVEL)));
+        for name in NODES {
+            let _ = event.nodes.add(node(name), level.clone());
+        }
+    }
+
     fn register_commands(&self, _: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
         for (usage, level) in sm::commands::usages() {
-            // squaremap's `word?` (the client asks for world names) is plain `word` here; the
-            // names come from `tab_complete` below.
-            // Each subcommand path carries squaremap's node (`squaremap.command.fullrender`); the level
-            // decides when no permissions mod answers. The bare label and `confirm` have none.
-            let command = Command::op(&usage.replace("word?", "word"), level);
-            event.commands.push(match sm::commands::permission_node(&usage) {
-                Some(node) => command.with_node(&node),
-                None => command,
-            });
+            if sm::commands::permission_node(&usage).is_none() {
+                event.commands.push(Command::op(&usage.replace("word?", "word"), level));
+            }
+        }
+    }
+
+    fn register_node_commands(&self, _: &mut dyn ServerHost, event: &mut RegisterNodeCommandsEvent<'_>) {
+        // squaremap's `word?` (the client asks for world names) is plain `word` here; the
+        // names come from `tab_complete` below.
+        // Each subcommand path carries squaremap's node (`squaremap.command.fullrender`); the level
+        // decides when no permissions mod answers. The bare label and `confirm` have none (register_commands).
+        for (usage, level) in sm::commands::usages() {
+            if let Some(name) = sm::commands::permission_node(&usage) {
+                event.commands.push(Command::op(&usage.replace("word?", "word"), level).with_node(&node(&name)));
+            }
         }
     }
 
@@ -326,12 +474,13 @@ impl Hooks for Mod {
         if !sm::commands::is_ours(event.command) {
             return Flow::Continue;
         }
-        let Some(node) = sm::commands::permission_node(event.command) else { return Flow::Continue };
-        let allowed = host.player(event.player).is_some_and(|p| p.has_permission(&*host, &node));
+        let Some(name) = sm::commands::permission_node(event.command) else { return Flow::Continue };
+        let node = node(&name);
+        let allowed = host.player(event.player).is_some_and(|p| p.permission_bool(&mut *host, &node).unwrap_or(false));
         if allowed {
             return Flow::Continue;
         }
-        event.replies.push(Text::literal("\u{a7}cI'm sorry, but you do not have permission to perform this command. Please contact the server administrators if you believe that this is in error."));
+        event.replies.push(line_text(&sm::commands::no_permission()));
         event.cancelled = true;
         Flow::Cancel
     }
@@ -361,11 +510,12 @@ impl Hooks for Mod {
                 // The usage's node already gated the command (`with_node`); the core is told 4 when the node
                 // (or, without one, the level) lets the player through. `hide`/`show` for others asks its own node.
                 let allowed = match sm::commands::permission_node(&line) {
-                    Some(node) => player.has_permission(&*host, &node),
+                    Some(name) => player.permission_bool(&mut *host, &node(&name)).unwrap_or(false),
                     None => permission.level() >= sm::commands::OP_LEVEL,
                 };
                 let op = if allowed { 4 } else { 0 };
-                let others = sm::commands::others_node(&line).is_some_and(|n| player.has_permission(&*host, &n));
+                let others = sm::commands::others_node(&line)
+                    .is_some_and(|n| player.permission_bool(&mut *host, &node(&n)).unwrap_or(false));
                 sm::commands::Sender {
                     player: Some(sm::commands::SenderPlayer {
                         uuid: player.uuid(),
@@ -373,6 +523,7 @@ impl Hooks for Mod {
                         world: world.to_string(),
                         x: at[0],
                         z: at[2],
+                        yaw: player.entity().rotation(&*host).map_or(0.0, |r| f64::from(r[0])),
                     }),
                     permission: op,
                     others,
@@ -384,6 +535,10 @@ impl Hooks for Mod {
             _ => return Flow::Continue,
         };
         let lines = sm::commands::command(&line, &sender, &online(&*host));
+        if line.split_whitespace().nth(1).is_some_and(|w| w.eq_ignore_ascii_case("reload")) {
+            // `reload` also reads the language file again.
+            load_language();
+        }
         for l in &lines {
             let _ = host.commands().feedback(line_text(l));
         }

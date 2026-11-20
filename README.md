@@ -1,5 +1,9 @@
 # horizon-squaremap
 
+## Port status
+
+Compared with squaremap 1.4.3 (estimate): **79 %** of the original's commands, permissions, config keys, messages and features work today; **79 %** once our open Horizon PRs are merged; **79 %** with the engine changes we are writing; **79 %** with the newest Horizon SDK. Estimated count: 118/150 items. Status: not yet compiled after the 2026-11-20 round.
+
 > **Unofficial Rust port of squaremap for the Horizon server (https://github.com/arismoko/horizon). Not affiliated with or endorsed by the squaremap authors.**
 
 Not affiliated with squaremap or its authors.
@@ -26,7 +30,7 @@ This is a native trait mod: `horizon-mod.toml`, a `Cargo.toml` that depends on `
 - **What gets rendered.** Newly generated chunks (squaremap's `ChunkPopulateEvent`) and
   chunks whose blocks change (`Level.setBlock`), in batches every
   `render.background.interval-seconds`, at most `max-chunks-per-interval` per batch.
-  A changed chunk that unloads before its turn is rendered when it loads again.
+  A changed chunk is redrawn from the region files: right away when it unloaded, else after the next world save (the changed blocks are not on disk before).
 - **Full and radius renders** (`/squaremap fullrender`, `radiusrender`): the chunks already
   saved in the world's region files (`dimensions/<ns>/<level>/region/r.<x>.<z>.mca`) are
   read and drawn on a thread of their own, region by region in squaremap's spiral order;
@@ -46,7 +50,9 @@ This is a native trait mod: `horizon-mod.toml`, a `Cargo.toml` that depends on `
   `fullrender [world]`, `radiusrender <world> <radius> [x z]` (`~` for your position),
   `cancelrender [world]`, `pauserender [world]`, `resetmap <world>` + `confirm`,
   `progresslogging [toggle | rate <seconds>]`, `hide [player]`, `show [player]`, `reload`,
-  `link`. Worlds are `overworld`, `the_nether`, `the_end` (or `minecraft:...`). Every
+  `link`. A world is any level that is loaded now: `overworld`, `the_nether`, `the_end`
+  (or `minecraft:...`), or a mod's `namespace:name`. `resetmap` works on any loaded level,
+  the map's own commands only on levels whose map is enabled (`world-settings`). Every
   command but `help` checks `squaremap.command.<sub>` (`native_has_permission`, which a
   permissions mod can grant); without one, operator level 2 is needed. From the server
   console too.
@@ -57,7 +63,9 @@ This is a native trait mod: `horizon-mod.toml`, a `Cargo.toml` that depends on `
   `9 * value`, as ImageIO's PNG writer does with squaremap's setting.
 - **Web server.** `std::net`, GET/HEAD only, the JSON documents from memory, files from
   the web folder, binds `127.0.0.1` by default. The frontend is squaremap 1.4.3's,
-  written into the web folder on start (`web-directory.auto-update`).
+  written into the web folder on start (`web-directory.auto-update`), without its Minecraft-derived images
+  (hearts, armor, sky backgrounds), which the registry policy keeps out of mods. The biome colour maps are read from
+  the game's resource folder at start; without them biomes get a flat default tint.
 
 ## Config
 
@@ -72,8 +80,8 @@ The web folder defaults to `squaremap/web` inside the world folder.
 
 ## Not ported
 
-- The update checker and language files (English messages are built in, with squaremap's
-  colours, hovers and clicks; the help layout and some wording are guesses, see the Known gaps section).
+- The update checker (English messages are built in, with squaremap's colours, hovers and clicks; a language
+  file replaces the wording, see the Known gaps section).
 - `progresslogging toggle|rate` change the running server only; squaremap writes them
   back to its config.
 - Region files are read for chunks compressed with gzip, zlib or not at all (vanilla's
@@ -107,11 +115,16 @@ horizon-launcher native-build <path to this folder> --server-output <dir> --vers
 
 ## Known gaps
 
-What does not work yet on arismoko/horizon (each is marked `TODO(arismoko-api: ...)` in `src/lib.rs`):
+What does not work yet on arismoko/horizon (each is marked `TODO(arismoko-api: ...)` or `HMOD-GAP(...)` in `src/lib.rs`):
 
-- The web renderer does not start yet: arismoko has no block-state, biome or biome-zoom tables to render from, so commands answer and the config is read, but no tiles are drawn.
-- Loaded chunks are not snapshotted; tiles come from the region files.
-- No spawn marker; the invisibility and equipment hide rules for players are not applied.
+- The web renderer starts (the block-state and biome tables are built from the resource folder and the host); with the tables missing the commands still answer and the config is read, but no tiles are drawn.
+- Loaded chunks are not snapshotted (no chunk snapshot API): a changed chunk that is still loaded is redrawn from the region files after the next world save (one that unloaded, at once), so the live map follows the save, not the block change.
+- Levels follow the host's list (`list_levels`) as they load and unload (`level_load`, `level_unload`); a level keeps its index and queued work while it is closed. A level's height range comes from `LevelRef.height`, but its ceiling is vanilla's (only the nether has one): the host gives no dimension-type ceiling.
+- Display names are the real names (no nickname getter on Horizon).
+- The `map-invisibility-equipment` hide rule reads `minecraft:map_invisibility_equipment` through the host's registry tag query (`registry_entry_in_tag`); a datapack that edits the tag is followed only where the host answers, and the vanilla entry (carved pumpkin) answers when it does not.
+- Configuration is `config/squaremap-server.toml` (TOML); `plugins/squaremap/config.yml` and `advanced.yml` are read over it when present, and `locale/lang-*.yml` (`settings.language-file`) replaces the command messages (wording and placeholders; MiniMessage colours and click tags are not followed). The full and radius render settings (workers, limits) are not read.
+- `/squaremap help` follows cloud's paged help from memory (title bar and page arrows may differ in detail); `hide`/`show <player>` use Horizon's player argument, so selector errors are the engine's own wording.
+- Region files compressed with LZ4 are skipped; the swamp grass noise of chunks read from disk is approximated.
 
 ## Licence
 

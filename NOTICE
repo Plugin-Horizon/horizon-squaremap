@@ -8,4 +8,8 @@ Copyright notices of the original work (from squaremap's LICENSE, commit 2e158c2
 The licence text is in LICENSE. The web frontend in mixins/squaremap/core/web/ is squaremap's
 built frontend; it bundles Leaflet (BSD 2-Clause), see LICENSE.
 
-Minecraft textures and other game assets in the bundled web frontend belong to Mojang AB / Microsoft. This project is not affiliated with or endorsed by Mojang or Microsoft.
+Left out of the bundled web frontend: squaremap's armor and health icons, the three sky backgrounds and the
+preview image (Minecraft-derived art). The player tooltip therefore shows no hearts or armor icons, and the map
+has no sky background. The three biome colour maps (grass, foliage, dry foliage) are not shipped either: the mod
+reads them from the game's own resource folder (`assets/minecraft/textures/colormap/`) when it starts. This project
+is not affiliated with or endorsed by Mojang or Microsoft.
