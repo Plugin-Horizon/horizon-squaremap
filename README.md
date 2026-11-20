@@ -46,7 +46,9 @@ This is a native trait mod: `horizon-mod.toml`, a `Cargo.toml` that depends on `
   `fullrender [world]`, `radiusrender <world> <radius> [x z]` (`~` for your position),
   `cancelrender [world]`, `pauserender [world]`, `resetmap <world>` + `confirm`,
   `progresslogging [toggle | rate <seconds>]`, `hide [player]`, `show [player]`, `reload`,
-  `link`. Worlds are `overworld`, `the_nether`, `the_end` (or `minecraft:...`). Every
+  `link`. A world is any level that is loaded now: `overworld`, `the_nether`, `the_end`
+  (or `minecraft:...`), or a mod's `namespace:name`. `resetmap` works on any loaded level,
+  the map's own commands only on levels whose map is enabled (`world-settings`). Every
   command but `help` checks `squaremap.command.<sub>` (`native_has_permission`, which a
   permissions mod can grant); without one, operator level 2 is needed. From the server
   console too.
@@ -113,7 +115,7 @@ What does not work yet on arismoko/horizon (each is marked `TODO(arismoko-api: .
 
 - The web renderer starts (the block-state and biome tables are built from the resource folder and the host); with the tables missing the commands still answer and the config is read, but no tiles are drawn.
 - Loaded chunks are not snapshotted (no chunk snapshot API): a changed chunk that is still loaded is redrawn from the region files after the next world save (one that unloaded, at once), so the live map follows the save, not the block change.
-- Only the three vanilla dimensions are mapped (`minecraft:overworld`, `the_nether`, `the_end`); other levels are not listed, rendered or accepted by `fullrender`/`resetmap`.
+- Levels follow the host's list (`list_levels`) as they load and unload (`level_load`, `level_unload`); a level keeps its index and queued work while it is closed. A level's height range comes from `LevelRef.height`, but its ceiling is vanilla's (only the nether has one): the host gives no dimension-type ceiling.
 - Display names are the real names (no nickname getter on Horizon).
 - The `map-invisibility-equipment` hide rule reads `minecraft:map_invisibility_equipment` through the host's registry tag query (`registry_entry_in_tag`); a datapack that edits the tag is followed only where the host answers, and the vanilla entry (carved pumpkin) answers when it does not.
 - Configuration is `config/squaremap-server.toml` (TOML); `plugins/squaremap/config.yml` and `advanced.yml` are read over it when present, and `locale/lang-*.yml` (`settings.language-file`) replaces the command messages (wording and placeholders; MiniMessage colours and click tags are not followed). The full and radius render settings (workers, limits) are not read.
