@@ -909,6 +909,7 @@ impl Runtime {
         let (tables, config, tiles) = (w.tables.clone(), w.config.clone(), w.tiles.clone());
         let c = control.clone();
         let max_zoom = config.map.zoom.maximum;
+        let label = id.clone();
         let thread = thread::Builder::new().name(format!("squaremap-render-[{id}]")).spawn(move || {
             let unsaved = c.unsaved.clone();
             let job = render::Job {
@@ -939,7 +940,7 @@ impl Runtime {
         });
         match thread {
             Ok(t) => w.job = Some(JobHandle { mode, control, thread: Some(t) }),
-            Err(e) => eprintln!("[squaremap] could not start the render of {id}: {e}"),
+            Err(e) => eprintln!("[squaremap] could not start the render of {label}: {e}"),
         }
     }
 

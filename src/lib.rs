@@ -18,7 +18,7 @@ use mod_api::{
     Config, ConfigKind, ConfigLoadingEvent, ConfigReloadingEvent, EquipmentSlot, Flow, HostSide, Hooks, Identifier,
     LevelLoadEvent, LevelUnloadEvent, LivingRef, NodeDefault, RegistryEntry,
     PermissionGatherNodesEvent, PermissionLevel, PermissionNode, PermissionValueType, PlayerCommandEvent,
-    RegisterCommandsEvent, RegisterConfigsEvent, RunModCommandEvent, ServerHost, ServerStartedEvent,
+    RegisterCommandsEvent, RegisterNodeCommandsEvent, RegisterConfigsEvent, RunModCommandEvent, ServerHost, ServerStartedEvent,
     ServerStoppingEvent, ServerTickEvent, ServerTickPhase, Suggestion, TabCompleteEvent, Text, WorldSavedEvent,
 };
 use mod_api::text::{TextClick, TextHover, TextStyle};
@@ -450,15 +450,21 @@ impl Hooks for Mod {
 
     fn register_commands(&self, _: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
         for (usage, level) in sm::commands::usages() {
-            // squaremap's `word?` (the client asks for world names) is plain `word` here; the
-            // names come from `tab_complete` below.
-            // Each subcommand path carries squaremap's node (`squaremap.command.fullrender`); the level
-            // decides when no permissions mod answers. The bare label and `confirm` have none.
-            let command = Command::op(&usage.replace("word?", "word"), level);
-            event.commands.push(match sm::commands::permission_node(&usage) {
-                Some(name) => command.with_node(&node(&name)),
-                None => command,
-            });
+            if sm::commands::permission_node(&usage).is_none() {
+                event.commands.push(Command::op(&usage.replace("word?", "word"), level));
+            }
+        }
+    }
+
+    fn register_node_commands(&self, _: &mut dyn ServerHost, event: &mut RegisterNodeCommandsEvent<'_>) {
+        // squaremap's `word?` (the client asks for world names) is plain `word` here; the
+        // names come from `tab_complete` below.
+        // Each subcommand path carries squaremap's node (`squaremap.command.fullrender`); the level
+        // decides when no permissions mod answers. The bare label and `confirm` have none (register_commands).
+        for (usage, level) in sm::commands::usages() {
+            if let Some(name) = sm::commands::permission_node(&usage) {
+                event.commands.push(Command::op(&usage.replace("word?", "word"), level).with_node(&node(&name)));
+            }
         }
     }
 

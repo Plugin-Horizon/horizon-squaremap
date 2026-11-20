@@ -310,8 +310,9 @@ fn number_out_of_range(input: &str) -> Line {
 fn bad_location(input: &str) -> Line {
     invalid_argument(tr(
         "command.message.parser-exception.location.invalid_format",
-        "'<input>' is not a valid location. Required format is '<x> <z>'",
-        &[("input", input)],
+        "'<input>' is not a valid location. Required format is '<format>'",
+        // `fill` drops unknown `<...>` tags, so the literal `<x> <z>` comes in as a value.
+        &[("input", input), ("format", "<x> <z>")],
     ))
 }
 
@@ -898,7 +899,8 @@ pub fn world_completions(command: &str) -> Vec<String> {
             continue;
         }
         let short = id.strip_prefix("minecraft:").unwrap_or(id.as_str());
-        let candidates: Vec<&str> = if typed.is_empty() { vec![id.as_str()] } else { vec![short, id.as_str()] };
+        // A level outside `minecraft:` has no short name: its one candidate is listed once.
+        let candidates: Vec<&str> = if typed.is_empty() || short == id.as_str() { vec![id.as_str()] } else { vec![short, id.as_str()] };
         out.extend(
             candidates
                 .into_iter()
