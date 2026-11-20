@@ -1,5 +1,20 @@
 # hmod port: squaremap
-Parity: before ~60% -> after ~78% (117/150 items; method: audit counts of commands, nodes, config keys, message keys and behaviours, estimated, blocked-by-API items count as not done)
+Parity: before ~60% -> after ~79% now / ~79% with our PRs (118/150 items; method: audit counts of commands, nodes, config keys, message keys and behaviours, estimated, blocked-by-API items count as not done)
+Round 4 (100 % brief, blind, no compile; hmod-format branch)
+- Fixed: `map-invisibility-equipment` reads the item tag `minecraft:map_invisibility_equipment` through `registry_entry_in_tag` (the query veinminer-cr uses); the vanilla entry (carved pumpkin) answers only when the host gives none. `src/lib.rs` `is_map_invisibility_item`, `has_map_invisibility_equipment`. README Known gaps updated.
+- Checked against the original this round, already matching (the audit file's bugs 5-7 and gap list were older than these commits): spawn marker, `invisible` hide rule, `show-armor`/`show-health` in `players.json`, the newline in the no-permission text, bare `/squaremap` answer, `link` text and uuid form, `hide`/`show` messages, `log.started-full-render` for the console.
+- Checklist round 100 (ticked = matches the original as read; open = not done):
+  - [x] permission nodes (13, Level 2 default as port; original unregistered = op default)
+  - [x] commands `help`, `fullrender`, `radiusrender` (args), `cancelrender`, `pauserender`, `resetmap`+`confirm`, `progresslogging`, `hide`, `show`, `reload`, `link`
+  - [x] messages: render-in-progress, render-not-in-progress, cancelled-render, successfully-reset-map, paused/unpaused, no-such-world, map-not-enabled, confirmation-required, no-pending-commands, progresslogging.*, hide/show, link format, plugin-reloaded, command.prefix, command.description.*, exception.no-permission, invalid-argument, invalid-syntax
+  - [x] spawn marker, invisible rule, map-invisibility-equipment rule (this round), show-armor / show-health
+  - [ ] invalid-sender-type and command-execution messages: not reachable (no original command declares a sender type; the port has no exception path)
+  - [ ] `resetmap` for a level with the map disabled (original resets it; port refuses): needs the reset path to work without an enabled world
+  - [ ] every level, not only the three vanilla dimensions (Horizon `Levels::list_levels()` now exists, so the list is there; the fixed `DIMENSIONS`/`WORLDS`/`SHAPES` tables and the runtime still need a level registry)
+  - [ ] `radiusrender`/`hide`/`show` selector grammar and coordinate completion (engine-side selector parser, not on Horizon)
+  - [ ] nickname getter for `use-display-names` (API-blocked: only `player_set_nickname` exists)
+  - [ ] loaded-chunk snapshot for background redraw (API-blocked: no chunk block read on the host; see GAPS_UPSTREAM.md line for squaremap)
+  - [ ] biome zoom / swamp noise, LZ4 region files, language-file colours and click tags, cloud-style help layout (known, see README)
 Round 3 (blind, no compile)
 - Fixed: background redraw of changed chunks (`src/horizon_squaremap/runtime.rs` `due_chunk`, `world_saved`, `Work::Disk`; `src/lib.rs` `world_saved` hook): a changed chunk that is still loaded waits for the next world save and is then drawn by the render thread from the region files; one that unloaded meanwhile is drawn from them at once. Before, the mark was consumed and the tile redrawn from the old save.
 - Fixed: the bare label answers `Invalid command syntax. Correct command syntax is: /squaremap <cancelrender|confirm|...>` (cloud's answer), with the special characters in white; `invalid_syntax` highlights them for every command.

@@ -15,8 +15,8 @@ use horizon_squaremap as sm;
 use mod_api::{
     BlockChangedEvent, BlockMetadata, ChunkLoadEvent, ChunkUnloadEvent, Command, CommandArgumentValue, CommandSource,
     HostBlockStates,
-    Config, ConfigKind, ConfigLoadingEvent, ConfigReloadingEvent, EquipmentSlot, Flow, HostSide, Hooks, LivingRef,
-    NodeDefault,
+    Config, ConfigKind, ConfigLoadingEvent, ConfigReloadingEvent, EquipmentSlot, Flow, HostSide, Hooks, Identifier,
+    LivingRef, NodeDefault, RegistryEntry,
     PermissionGatherNodesEvent, PermissionLevel, PermissionNode, PermissionValueType, PlayerCommandEvent,
     RegisterCommandsEvent, RegisterConfigsEvent, RunModCommandEvent, ServerHost, ServerStartedEvent,
     ServerStoppingEvent, ServerTickEvent, ServerTickPhase, Suggestion, TabCompleteEvent, Text, WorldSavedEvent,
@@ -196,19 +196,27 @@ fn level_border(host: &mut dyn ServerHost, dimension: &str) -> Option<([f64; 4],
     Some((border, spawn))
 }
 
-/// What `minecraft:map_invisibility_equipment` holds (the item tag has no query on Horizon, so its one
-/// vanilla entry stands in; a datapack that edits the tag is not followed).
-const MAP_INVISIBILITY_ITEMS: [&str; 1] = ["minecraft:carved_pumpkin"];
+/// The item tag `minecraft:map_invisibility_equipment` (`ItemTags.MAP_INVISIBILITY_EQUIPMENT`).
+const MAP_INVISIBILITY_TAG: &str = "minecraft:map_invisibility_equipment";
+
+/// The tag's one vanilla entry: the answer when the host gives none.
+const MAP_INVISIBILITY_FALLBACK: &str = "minecraft:carved_pumpkin";
+
+/// Whether the item `id` is in `minecraft:map_invisibility_equipment`, read from the host's item tags
+/// (`registry_entry_in_tag`, as veinminer's item tag check); the vanilla entry answers when the host has none.
+fn is_map_invisibility_item(host: &dyn ServerHost, id: &str) -> bool {
+    let fallback = id == MAP_INVISIBILITY_FALLBACK;
+    let (Ok(registry), Ok(entry)) = (Identifier::parse("minecraft:item"), Identifier::parse(id)) else {
+        return fallback;
+    };
+    host.registry_entry_in_tag(&RegistryEntry::new(registry, entry), MAP_INVISIBILITY_TAG).unwrap_or(fallback)
+}
 
 /// `MapItemSavedData.hasMapInvisibilityItemEquipped`: an item of the tag in an armour or body slot.
 fn has_map_invisibility_equipment(host: &dyn ServerHost, living: LivingRef) -> bool {
     [EquipmentSlot::Feet, EquipmentSlot::Legs, EquipmentSlot::Chest, EquipmentSlot::Head, EquipmentSlot::Body, EquipmentSlot::Saddle]
         .into_iter()
-        .any(|slot| {
-            living
-                .equipment(host, slot)
-                .is_some_and(|stack| MAP_INVISIBILITY_ITEMS.contains(&stack.item().id(host).as_str()))
-        })
+        .any(|slot| living.equipment(host, slot).is_some_and(|stack| is_map_invisibility_item(host, &stack.item().id(host))))
 }
 
 /// The players squaremap draws, less the ones a level's `player-tracker.hide` rules leave out:

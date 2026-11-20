@@ -115,7 +115,7 @@ What does not work yet on arismoko/horizon (each is marked `TODO(arismoko-api: .
 - Loaded chunks are not snapshotted (no chunk snapshot API): a changed chunk that is still loaded is redrawn from the region files after the next world save (one that unloaded, at once), so the live map follows the save, not the block change.
 - Only the three vanilla dimensions are mapped (`minecraft:overworld`, `the_nether`, `the_end`); other levels are not listed, rendered or accepted by `fullrender`/`resetmap`.
 - Display names are the real names (no nickname getter on Horizon).
-- The `map-invisibility-equipment` hide rule checks the vanilla tag's one entry (carved pumpkin): there is no item tag query.
+- The `map-invisibility-equipment` hide rule reads `minecraft:map_invisibility_equipment` through the host's registry tag query (`registry_entry_in_tag`); a datapack that edits the tag is followed only where the host answers, and the vanilla entry (carved pumpkin) answers when it does not.
 - Configuration is `config/squaremap-server.toml` (TOML); `plugins/squaremap/config.yml` and `advanced.yml` are read over it when present, and `locale/lang-*.yml` (`settings.language-file`) replaces the command messages (wording and placeholders; MiniMessage colours and click tags are not followed). The full and radius render settings (workers, limits) are not read.
 - `/squaremap help` follows cloud's paged help from memory (title bar and page arrows may differ in detail); `hide`/`show <player>` use Horizon's player argument, so selector errors are the engine's own wording.
 - Region files compressed with LZ4 are skipped; the swamp grass noise of chunks read from disk is approximated.
