@@ -1,5 +1,9 @@
 # horizon-squaremap
 
+## Port status
+
+Compared with squaremap 1.4.3 (estimate): **79 %** of the original's commands, permissions, config keys, messages and features work today; **79 %** once our open Horizon PRs are merged; **79 %** with the engine changes we are writing; **79 %** with the newest Horizon SDK. Estimated count: 118/150 items. Status: not yet compiled after the 2026-11-20 round.
+
 > **Unofficial Rust port of squaremap for the Horizon server (https://github.com/arismoko/horizon). Not affiliated with or endorsed by the squaremap authors.**
 
 Not affiliated with squaremap or its authors.
