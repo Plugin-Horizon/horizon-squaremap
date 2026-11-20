@@ -589,4 +589,16 @@ mod tests {
         assert_eq!(c.world("minecraft:overworld").map.order, 1);
         assert!(c.world("minecraft:the_nether").map.glass.clear);
     }
+
+    #[test]
+    fn a_custom_level_has_its_own_section_and_the_default_for_the_rest() {
+        let c = Config::parse(
+            "[world-settings.default.map]\norder = 1\n[world-settings.\"mod:castle\".map]\nenabled = false\n",
+        )
+        .unwrap();
+        assert!(!c.world("mod:castle").map.enabled);
+        assert_eq!(c.world("mod:castle").map.order, 1);
+        assert!(c.world("minecraft:the_end").map.enabled);
+        assert_eq!(c.world("minecraft:the_end").map.order, 1);
+    }
 }

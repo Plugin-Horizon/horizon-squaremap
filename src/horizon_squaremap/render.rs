@@ -328,7 +328,7 @@ pub static PROGRESS_INTERVAL: AtomicU64 = AtomicU64::new(1);
 
 /// What a job needs; everything is owned or shared, nothing borrows the runtime.
 pub struct Job {
-    pub world_id: &'static str,
+    pub world_id: String,
     pub mode: Mode,
     pub plan: Plan,
     pub checkpoint: PathBuf,
@@ -377,7 +377,7 @@ pub fn run(mut job: Job) -> bool {
                 if !c.paused.load(Ordering::Relaxed) && c.unsaved.load(Ordering::Relaxed) < MAX_UNSAVED {
                     break;
                 }
-                progress.tick(&c, job.world_id);
+                progress.tick(&c, &job.world_id);
                 std::thread::sleep(Duration::from_millis(100));
             }
             if (job.loaded)(cx, cz) {
@@ -400,7 +400,7 @@ pub fn run(mut job: Job) -> bool {
             if !row_only {
                 c.done_chunks.fetch_add(1, Ordering::Relaxed);
             }
-            progress.tick(&c, job.world_id);
+            progress.tick(&c, &job.world_id);
         }
         if drew {
             c.unsaved.fetch_add(1, Ordering::Relaxed);
@@ -410,7 +410,7 @@ pub fn run(mut job: Job) -> bool {
         c.done_regions.fetch_add(1, Ordering::Relaxed);
         save_checkpoint(&job.checkpoint, job.mode, &job.plan);
     }
-    progress.close(&c, job.world_id);
+    progress.close(&c, &job.world_id);
     if outcome_complete || c.cancel.load(Ordering::Relaxed) {
         let _ = std::fs::remove_file(&job.checkpoint);
     }
@@ -628,7 +628,7 @@ mod tests {
         let control = Arc::new(Control::default());
         let (s, l, u) = (saved.clone(), live.clone(), control.unsaved.clone());
         let job = Job {
-            world_id: "minecraft:overworld",
+            world_id: "minecraft:overworld".into(),
             mode: Mode::Radius,
             plan: Plan::chunks(spiral(0, 0, 1), |_, _| true),
             checkpoint: dir.join("data/resume_render.json"),
@@ -661,7 +661,7 @@ mod tests {
         control.stop.store(true, Ordering::Relaxed);
         let config = Config::parse(DEFAULT_TOML).unwrap().world("minecraft:overworld");
         let job = Job {
-            world_id: "minecraft:overworld",
+            world_id: "minecraft:overworld".into(),
             mode: Mode::Full,
             plan: Plan::regions(&[(0, 0)], |_, _| true),
             checkpoint: dir.join("resume_render.json"),

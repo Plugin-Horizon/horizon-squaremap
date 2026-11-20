@@ -4,7 +4,7 @@
 //! render, job and web threads only get owned or shared data.
 use crate::horizon_squaremap::config::{Config, Hide, WorldConfig};
 use crate::horizon_squaremap::image::RegionImage;
-use crate::horizon_squaremap::json::{self, Player, WORLDS};
+use crate::horizon_squaremap::json::{self, Player};
 use crate::horizon_squaremap::region::{region_dir, DiskCache, Ids, Shape, WorldEnv};
 use crate::horizon_squaremap::render::{self, Control, Mode, Plan};
 use crate::horizon_squaremap::scan::{scan_chunk_with, ChunkView};
@@ -36,10 +36,25 @@ static EARLY: Mutex<Vec<(usize, i32, i32)>> = Mutex::new(Vec::new());
 static LOADED: Mutex<Option<HashSet<(usize, i32, i32)>>> = Mutex::new(None);
 /// Loaded chunks a render job handed over, drawn with the next batch.
 static HANDOFF: Mutex<Vec<(usize, i32, i32)>> = Mutex::new(Vec::new());
-/// Each level's height range as it last ticked.
-static SHAPES: Mutex<[Option<Shape>; 3]> = Mutex::new([None; 3]);
+/// Every level the map has seen, in the order it first saw them. An index is kept for the life of the process
+/// (render jobs and chunk events refer to levels by it), so a level that closed keeps its slot and its settings.
+static LEVELS: Mutex<Vec<Level>> = Mutex::new(Vec::new());
 /// What `start` was given, for `/squaremap reload`.
 static STARTED: Mutex<Option<StartArgs>> = Mutex::new(None);
+
+/// Serialises the tests that touch [`LEVELS`] (it is process-wide).
+#[cfg(test)]
+pub static REGISTRY_TESTS: Mutex<()> = Mutex::new(());
+
+/// One level of the registry.
+#[derive(Clone)]
+struct Level {
+    id: String,
+    /// Loaded now (`Levels.list_levels`).
+    open: bool,
+    /// Height range and ceiling, as the host reports them when the level opens; vanilla's for the id until then.
+    shape: Option<Shape>,
+}
 
 #[derive(Clone)]
 struct StartArgs {
@@ -56,7 +71,9 @@ struct JobHandle {
 }
 
 struct World {
-    id: &'static str,
+    id: String,
+    /// `<tiles>/<web name>`: where this level's region images and documents go.
+    tiles: Arc<PathBuf>,
     config: Arc<WorldConfig>,
     tables: Arc<Tables>,
     /// Chunks changed since they were last drawn.
@@ -102,6 +119,7 @@ enum Work {
         tables: Arc<Tables>,
         config: Arc<WorldConfig>,
         region_dir: Arc<PathBuf>,
+        tiles: Arc<PathBuf>,
         ids: Arc<Ids>,
     },
     /// A chunk drawn from the region files, read on the render thread (a changed chunk once it is saved).
@@ -112,13 +130,14 @@ enum Work {
         tables: Arc<Tables>,
         config: Arc<WorldConfig>,
         region_dir: Arc<PathBuf>,
+        tiles: Arc<PathBuf>,
         ids: Arc<Ids>,
         env: Arc<WorldEnv>,
     },
     /// A finished region of a full or radius render.
-    Region { world: usize, image: RegionImage, max_zoom: i32, unsaved: Arc<AtomicUsize> },
+    Region { world: usize, image: RegionImage, max_zoom: i32, unsaved: Arc<AtomicUsize>, tiles: Arc<PathBuf> },
     /// `resetmap`: drop the level's pending images and empty its tiles folder.
-    Reset { world: usize, done: mpsc::Sender<std::io::Result<()>> },
+    Reset { world: usize, tiles: Arc<PathBuf>, done: mpsc::Sender<std::io::Result<()>> },
     Stop,
 }
 
@@ -171,21 +190,78 @@ pub fn running() -> bool {
     RUNTIME.lock().unwrap().is_some()
 }
 
-/// The index of a level (`minecraft:the_nether`) among [`WORLDS`].
-pub fn world_index(id: &str) -> Option<usize> {
-    WORLDS.iter().position(|(w, _)| *w == id)
+/// Makes `ids` the open levels: the ones the game has loaded now (`level_load`, `level_unload`, and the levels open at
+/// start). A level not seen before gets the next index. A running map gets the new levels' workers and the web
+/// list is written again.
+pub fn set_open_levels(ids: &[String]) {
+    {
+        let mut levels = LEVELS.lock().unwrap();
+        for l in levels.iter_mut() {
+            l.open = ids.contains(&l.id);
+        }
+        for id in ids {
+            if !levels.iter().any(|l| &l.id == id) {
+                levels.push(Level { id: id.clone(), open: true, shape: None });
+            }
+        }
+    }
+    with(|rt| rt.sync_worlds());
 }
 
-/// A level's height range and ceiling, as it ticks (render jobs read the region files of
-/// levels that aren't open, with the shape they last had, else vanilla's).
+/// The index of a level (`minecraft:the_nether`, or a mod's `mod:castle`), open or not.
+pub fn world_index(id: &str) -> Option<usize> {
+    LEVELS.lock().unwrap().iter().position(|l| l.id == id)
+}
+
+/// The index of a level that is open now.
+pub fn open_world_index(id: &str) -> Option<usize> {
+    LEVELS.lock().unwrap().iter().position(|l| l.open && l.id == id)
+}
+
+/// The open levels with their indexes, in index order.
+pub fn open_levels() -> Vec<(usize, String)> {
+    LEVELS.lock().unwrap().iter().enumerate().filter(|(_, l)| l.open).map(|(i, l)| (i, l.id.clone())).collect()
+}
+
+/// The id of level `world` ("" for an unknown index).
+pub fn world_name(world: usize) -> String {
+    LEVELS.lock().unwrap().get(world).map(|l| l.id.clone()).unwrap_or_default()
+}
+
+/// Every level the map knows (open or not), in index order.
+pub fn level_ids() -> Vec<String> {
+    LEVELS.lock().unwrap().iter().map(|l| l.id.clone()).collect()
+}
+
+/// Whether level `world`'s map is enabled (`map.enabled` of its config). False before the map runs.
+pub fn world_enabled(world: usize) -> bool {
+    with(|rt| rt.worlds.get(world).is_some_and(|w| w.config.map.enabled)).unwrap_or(false)
+}
+
+/// A level's height range and ceiling, as the host reports them when the level opens (render jobs read the region
+/// files of levels that aren't open with the shape they last had, else vanilla's for the id).
 pub fn level_shape(world: usize, min_y: i32, top_y: i32, ceiling: bool) {
-    if let Some(slot) = SHAPES.lock().unwrap().get_mut(world) {
-        *slot = Some(Shape { min_y, top_y, ceiling });
+    if let Some(l) = LEVELS.lock().unwrap().get_mut(world) {
+        l.shape = Some(Shape { min_y, top_y, ceiling });
     }
 }
 
 fn shape(world: usize) -> Shape {
-    SHAPES.lock().unwrap().get(world).copied().flatten().unwrap_or_else(|| Shape::vanilla(WORLDS[world].0))
+    match LEVELS.lock().unwrap().get(world) {
+        Some(l) => l.shape.unwrap_or_else(|| Shape::vanilla(&l.id)),
+        None => Shape::vanilla(""),
+    }
+}
+
+/// Whether level `world` is open (its index from [`open_world_index`]).
+fn is_open(world: usize) -> bool {
+    LEVELS.lock().unwrap().get(world).is_some_and(|l| l.open)
+}
+
+/// Resumes the renders a stop interrupted, for the open levels with a checkpoint and no job running. Called when
+/// levels open (after their shapes are set) and at start.
+pub fn resume_renders() {
+    with(|rt| rt.resume_jobs());
 }
 
 /// Opens the map for a world folder with the game's block states and biomes, and what the
@@ -220,11 +296,10 @@ fn start_with(args: StartArgs) -> Result<(), String> {
     };
     let (jobs, rx) = mpsc::channel();
     let in_flight = Arc::new(AtomicUsize::new(0));
-    let tiles = web.join("tiles");
     let counter = in_flight.clone();
     let render = thread::Builder::new()
         .name("squaremap-render".into())
-        .spawn(move || render_loop(rx, tiles, counter))
+        .spawn(move || render_loop(rx, counter))
         .map_err(|e| e.to_string())?;
     let biome_names: Vec<String> = biomes.iter().map(|b| b.name.clone()).collect();
     let ids = Arc::new(Ids::new(&states, &biome_names));
@@ -249,21 +324,11 @@ fn start_with(args: StartArgs) -> Result<(), String> {
     };
     rt.apply_config();
     for (w, cx, cz) in EARLY.lock().unwrap().drain(..) {
-        if let Some(w) = rt.worlds.get_mut(w) {
+        if let Some(w) = rt.worlds.get_mut(w).filter(|w| w.config.map.enabled) {
             w.dirty.insert((cx, cz));
         }
     }
-    for w in 0..rt.worlds.len() {
-        if !rt.worlds[w].config.map.enabled {
-            continue;
-        }
-        if let Some((mode, mut plan)) = render::read_checkpoint(&rt.checkpoint(w)) {
-            let config = rt.worlds[w].config.clone();
-            plan.retain(|x, z| config.map.chunk_visible(x, z));
-            eprintln!("[squaremap] Rendering map for {} has been resumed", WORLDS[w].0);
-            rt.spawn_job(w, mode, Box::new(move |_| plan));
-        }
-    }
+    rt.resume_jobs();
     *RUNTIME.lock().unwrap() = Some(rt);
     Ok(())
 }
@@ -316,7 +381,7 @@ fn with<T>(f: impl FnOnce(&mut Runtime) -> T) -> Option<T> {
 pub fn chunk_loaded(world: usize, cx: i32, cz: i32, new: bool) {
     LOADED.lock().unwrap().get_or_insert_with(HashSet::new).insert((world, cx, cz));
     let started = with(|rt| {
-        if let Some(w) = rt.worlds.get_mut(world) {
+        if let Some(w) = rt.worlds.get_mut(world).filter(|w| w.config.map.enabled) {
             if new || w.stale.remove(&(cx, cz)) {
                 w.dirty.insert((cx, cz));
             }
@@ -342,7 +407,7 @@ pub fn is_loaded(world: usize, cx: i32, cz: i32) -> bool {
 /// A block of level `world` changed.
 pub fn block_changed(world: usize, x: i32, z: i32) {
     with(|rt| {
-        if let Some(w) = rt.worlds.get_mut(world) {
+        if let Some(w) = rt.worlds.get_mut(world).filter(|w| w.config.map.enabled) {
             w.dirty.insert((x >> 4, z >> 4));
         }
     });
@@ -360,7 +425,8 @@ pub fn due_chunks(world: usize) -> Vec<(i32, i32)> {
     };
     with(|rt| {
         let free = MAX_IN_FLIGHT.saturating_sub(rt.in_flight.load(Ordering::Relaxed));
-        let Some(w) = rt.worlds.get_mut(world) else { return Vec::new() };
+        // A level whose map is disabled is never drawn (squaremap has no map world for it).
+        let Some(w) = rt.worlds.get_mut(world).filter(|w| w.config.map.enabled) else { return Vec::new() };
         if w.job.as_ref().is_some_and(|j| j.control.finished.load(Ordering::Relaxed)) {
             if let Some(t) = w.job.take().and_then(|mut j| j.thread.take()) {
                 let _ = t.join();
@@ -432,7 +498,8 @@ pub fn submit_disk(world: usize, cx: i32, cz: i32) {
             cz,
             tables: w.tables.clone(),
             config: w.config.clone(),
-            region_dir: Arc::new(region_dir(&rt.dir, w.id)),
+            region_dir: Arc::new(region_dir(&rt.dir, &w.id)),
+            tiles: w.tiles.clone(),
             ids: rt.ids.clone(),
             env: rt.env.clone(),
         };
@@ -461,7 +528,8 @@ pub fn submit(world: usize, view: Box<dyn ChunkView>) {
             view,
             tables: w.tables.clone(),
             config: w.config.clone(),
-            region_dir: Arc::new(region_dir(&rt.dir, w.id)),
+            region_dir: Arc::new(region_dir(&rt.dir, &w.id)),
+            tiles: w.tiles.clone(),
             ids: rt.ids.clone(),
         };
         rt.in_flight.fetch_add(1, Ordering::Relaxed);
@@ -494,7 +562,13 @@ pub fn hide_rules(world: &str) -> Hide {
 /// hidden with `/squaremap hide` or the API are left out here).
 pub fn publish_players(list: &[Player], max: usize) {
     with(|rt| {
-        let shown: Vec<Player> = list.iter().filter(|p| !crate::horizon_squaremap::api::player_hidden(p.uuid)).cloned().collect();
+        // Players in a level whose map is disabled are not on the map.
+        let enabled = |w: &str| world_index(w).and_then(|i| rt.worlds.get(i)).is_some_and(|w| w.config.map.enabled);
+        let shown: Vec<Player> = list
+            .iter()
+            .filter(|p| !crate::horizon_squaremap::api::player_hidden(p.uuid) && enabled(p.world.as_str()))
+            .cloned()
+            .collect();
         let doc = json::players(&shown, max, |w| {
             world_index(w).and_then(|i| rt.worlds.get(i)).map_or(json::TrackerShows::default(), |w| {
                 let t = &w.config.player_tracker;
@@ -548,11 +622,11 @@ pub fn publish_markers(world: usize, spawn: Option<[i32; 2]>, border: [f64; 4]) 
             return;
         }
         w.markers = key;
-        let name = json::web_name(w.id);
+        let name = json::web_name(&w.id);
         let settings = json::world_settings(&w.config, spawn.unwrap_or_default()).to_string();
         let mut layers = json::markers(&w.config, spawn, border, now_millis());
         if let serde_json::Value::Array(list) = &mut layers {
-            list.extend(crate::horizon_squaremap::api::layers_json(w.id));
+            list.extend(crate::horizon_squaremap::api::layers_json(&w.id));
         }
         rt.put(&format!("/tiles/{name}/settings.json"), settings);
         rt.put(&format!("/tiles/{name}/markers.json"), layers.to_string());
@@ -576,9 +650,9 @@ pub enum RenderRefused {
 pub fn start_full_render(world: usize) -> Result<(), RenderRefused> {
     with(|rt| {
         rt.check_idle(world)?;
-        let dir = region_dir(&rt.dir, WORLDS[world].0);
+        let id = rt.worlds[world].id.clone();
+        let dir = region_dir(&rt.dir, &id);
         let config = rt.worlds[world].config.clone();
-        let id = WORLDS[world].0;
         eprintln!("[squaremap] Started full map render for {id}");
         rt.spawn_job(
             world,
@@ -602,7 +676,7 @@ pub fn start_radius_render(world: usize, center: [i32; 2], radius: i32) -> Resul
     with(|rt| {
         rt.check_idle(world)?;
         let config = rt.worlds[world].config.clone();
-        eprintln!("[squaremap] Started radius map render for {}", WORLDS[world].0);
+        eprintln!("[squaremap] Started radius map render for {}", rt.worlds[world].id);
         rt.spawn_job(
             world,
             Mode::Radius,
@@ -621,6 +695,9 @@ pub fn start_radius_render(world: usize, center: [i32; 2], radius: i32) -> Resul
 pub fn cancel_render(world: usize) -> Result<(), RenderRefused> {
     let handle = with(|rt| {
         let w = rt.worlds.get_mut(world).ok_or(RenderRefused::NotEnabled)?;
+        if !w.config.map.enabled {
+            return Err(RenderRefused::NotEnabled);
+        }
         match w.job.take() {
             Some(j) if !j.control.finished.load(Ordering::Relaxed) => {
                 j.control.cancel.store(true, Ordering::Relaxed);
@@ -638,15 +715,18 @@ pub fn cancel_render(world: usize) -> Result<(), RenderRefused> {
     Ok(())
 }
 
-/// `pauserender`: toggles the level's pause; true when it is now paused.
-pub fn toggle_pause(world: usize) -> Option<bool> {
+/// `pauserender`: toggles the level's pause; `Ok(true)` when it is now paused.
+pub fn toggle_pause(world: usize) -> Result<bool, RenderRefused> {
     with(|rt| {
-        let w = rt.worlds.get(world)?;
+        let w = rt.worlds.get(world).ok_or(RenderRefused::NotEnabled)?;
+        if !w.config.map.enabled {
+            return Err(RenderRefused::NotEnabled);
+        }
         let now = !w.paused.load(Ordering::Relaxed);
         w.paused.store(now, Ordering::Relaxed);
-        Some(now)
+        Ok(now)
     })
-    .flatten()
+    .unwrap_or(Err(RenderRefused::NotRunning))
 }
 
 /// What a level's render is doing: (mode, chunks done, chunks in all, paused).
@@ -682,15 +762,20 @@ pub fn reset_map(world: usize) -> Result<(), String> {
         w.unsaved.clear();
         w.markers.clear();
         let (tx, rx) = mpsc::channel();
-        rt.jobs.send(Work::Reset { world, done: tx }).map_err(|e| e.to_string())?;
+        rt.jobs.send(Work::Reset { world, tiles: w.tiles.clone(), done: tx }).map_err(|e| e.to_string())?;
         Ok(rx)
     })
     .unwrap_or(Err("the map has not started".into()))?;
     done.recv().map_err(|e| e.to_string())?.map_err(|e| e.to_string())?;
+    // Like squaremap: the cached documents of the level go, and its settings are written again when its map is on.
     with(|rt| {
-        let name = json::web_name(WORLDS[world].0);
-        let settings = json::world_settings(&rt.worlds[world].config, [0, 0]).to_string();
-        rt.put(&format!("/tiles/{name}/settings.json"), settings);
+        let Some(w) = rt.worlds.get(world) else { return };
+        let name = json::web_name(&w.id);
+        rt.json.clear(&format!("/tiles/{name}/"));
+        if w.config.map.enabled {
+            let settings = json::world_settings(&w.config, [0, 0]).to_string();
+            rt.put(&format!("/tiles/{name}/settings.json"), settings);
+        }
     });
     Ok(())
 }
@@ -724,7 +809,78 @@ impl Runtime {
     }
 
     fn checkpoint(&self, world: usize) -> PathBuf {
-        self.dir.join("squaremap").join("data").join(json::web_name(WORLDS[world].0)).join("resume_render.json")
+        self.dir.join("squaremap").join("data").join(json::web_name(&self.worlds[world].id)).join("resume_render.json")
+    }
+
+    /// Resumes the renders of open, enabled levels that a stop interrupted (their checkpoint), where no job runs.
+    fn resume_jobs(&mut self) {
+        for w in 0..self.worlds.len() {
+            if !self.worlds[w].config.map.enabled || self.worlds[w].job.is_some() || !is_open(w) {
+                continue;
+            }
+            if let Some((mode, mut plan)) = render::read_checkpoint(&self.checkpoint(w)) {
+                let config = self.worlds[w].config.clone();
+                plan.retain(|x, z| config.map.chunk_visible(x, z));
+                eprintln!("[squaremap] Rendering map for {} has been resumed", self.worlds[w].id);
+                self.spawn_job(w, mode, Box::new(move |_| plan));
+            }
+        }
+    }
+
+    /// A level opened or closed: the levels that are new since the last call get their workers, and the web list
+    /// is written again.
+    fn sync_worlds(&mut self) {
+        let ids = level_ids();
+        for id in ids.iter().skip(self.worlds.len()) {
+            let w = self.build_world(id, None);
+            self.worlds.push(w);
+        }
+        self.put_settings();
+    }
+
+    /// `/tiles/settings.json`: the open levels whose map is enabled (`WebSettingsPublisher`).
+    fn put_settings(&self) {
+        let open: Vec<String> = open_levels().into_iter().map(|(_, id)| id).collect();
+        let refs: Vec<&str> = open.iter().map(String::as_str).collect();
+        self.put("/tiles/settings.json", json::settings(&self.config, &refs).to_string());
+    }
+
+    /// One level's worker: its config (the default section with its own over it), its tables, and the state it
+    /// keeps across a config reload (`previous`).
+    fn build_world(&self, id: &str, previous: Option<&mut World>) -> World {
+        let now = Instant::now();
+        let mut config = self.config.world(id);
+        let border = previous.as_ref().and_then(|o| o.border);
+        if border.is_some() {
+            config.map.resolve(border);
+        }
+        let tables = Tables::build(&self.raw.0, &self.raw.1, &config);
+        let mut w = World {
+            id: id.to_owned(),
+            tiles: Arc::new(self.web.join("tiles").join(json::web_name(id))),
+            config: Arc::new(config),
+            tables: Arc::new(tables),
+            dirty: HashSet::new(),
+            stale: HashSet::new(),
+            unsaved: HashSet::new(),
+            ready: VecDeque::new(),
+            next_batch: now,
+            next_markers: now,
+            markers: String::new(),
+            border,
+            paused: Arc::new(AtomicBool::new(false)),
+            job: None,
+        };
+        if let Some(o) = previous {
+            w.dirty = std::mem::take(&mut o.dirty);
+            w.stale = std::mem::take(&mut o.stale);
+            w.unsaved = std::mem::take(&mut o.unsaved);
+            w.ready = std::mem::take(&mut o.ready);
+            w.next_batch = o.next_batch;
+            w.paused = o.paused.clone();
+            w.job = o.job.take();
+        }
+        w
     }
 
     fn check_idle(&self, world: usize) -> Result<(), RenderRefused> {
@@ -742,21 +898,21 @@ impl Runtime {
     /// can take a while).
     fn spawn_job(&mut self, world: usize, mode: Mode, plan: Box<dyn FnOnce(()) -> Plan + Send>) {
         let checkpoint = self.checkpoint(world);
-        let id = WORLDS[world].0;
-        let cache = DiskCache::new(region_dir(&self.dir, id), self.ids.clone(), shape(world));
+        let id = self.worlds[world].id.clone();
+        let cache = DiskCache::new(region_dir(&self.dir, &id), self.ids.clone(), shape(world));
         let (env, sender) = (self.env.clone(), self.jobs.clone());
         let w = &mut self.worlds[world];
         if let Some(t) = w.job.take().and_then(|mut j| j.thread.take()) {
             let _ = t.join(); // a finished one
         }
         let control = Arc::new(Control { paused: w.paused.clone(), ..Control::default() });
-        let (tables, config) = (w.tables.clone(), w.config.clone());
+        let (tables, config, tiles) = (w.tables.clone(), w.config.clone(), w.tiles.clone());
         let c = control.clone();
         let max_zoom = config.map.zoom.maximum;
         let thread = thread::Builder::new().name(format!("squaremap-render-[{id}]")).spawn(move || {
             let unsaved = c.unsaved.clone();
             let job = render::Job {
-                world_id: id,
+                world_id: id.clone(),
                 mode,
                 plan: plan(()),
                 checkpoint,
@@ -767,7 +923,7 @@ impl Runtime {
                 loaded: Box::new(move |x, z| is_loaded(world, x, z)),
                 live: Box::new(move |x, z| HANDOFF.lock().unwrap().push((world, x, z))),
                 save: Box::new(move |image| {
-                    let work = Work::Region { world, image, max_zoom, unsaved: unsaved.clone() };
+                    let work = Work::Region { world, image, max_zoom, unsaved: unsaved.clone(), tiles: tiles.clone() };
                     if sender.send(work).is_err() {
                         unsaved.fetch_sub(1, Ordering::Relaxed);
                     }
@@ -787,47 +943,17 @@ impl Runtime {
         }
     }
 
-    /// Builds each level's settings and tables from the config.
+    /// Builds every known level's worker again from the config (a config load or reload keeps each level's queue and
+    /// running job; the index of a level never changes).
     fn apply_config(&mut self) {
-        let now = Instant::now();
         let mut old = std::mem::take(&mut self.worlds);
-        for (i, (id, _)) in WORLDS.iter().enumerate() {
-            let mut config = self.config.world(id);
-            let previous = old.get_mut(i);
-            let border = previous.as_ref().and_then(|o| o.border);
-            if border.is_some() {
-                config.map.resolve(border);
-            }
-            let tables = Tables::build(&self.raw.0, &self.raw.1, &config);
-            let mut w = World {
-                id,
-                config: Arc::new(config),
-                tables: Arc::new(tables),
-                dirty: HashSet::new(),
-                stale: HashSet::new(),
-                unsaved: HashSet::new(),
-                ready: VecDeque::new(),
-                next_batch: now,
-                next_markers: now,
-                markers: String::new(),
-                border,
-                paused: Arc::new(AtomicBool::new(false)),
-                job: None,
-            };
-            if let Some(o) = previous {
-                w.dirty = std::mem::take(&mut o.dirty);
-                w.stale = std::mem::take(&mut o.stale);
-                w.unsaved = std::mem::take(&mut o.unsaved);
-                w.ready = std::mem::take(&mut o.ready);
-                w.next_batch = o.next_batch;
-                w.paused = o.paused.clone();
-                w.job = o.job.take();
-            }
+        for (i, id) in level_ids().iter().enumerate() {
+            let w = self.build_world(id, old.get_mut(i));
             let name = json::web_name(id);
             self.json.put(&format!("/tiles/{name}/settings.json"), json::world_settings(&w.config, [0, 0]).to_string());
             self.worlds.push(w);
         }
-        self.put("/tiles/settings.json", json::settings(&self.config).to_string());
+        self.put_settings();
     }
 }
 
@@ -845,8 +971,9 @@ fn write_frontend(web: &Path) -> std::io::Result<()> {
     std::fs::write(icon.join("squaremap-spawn_icon.png"), crate::horizon_squaremap::assets::file("images/icon/spawn.png").unwrap_or_default())
 }
 
-/// Deletes what a tiles folder holds, keeping the folder.
+/// Deletes what a tiles folder holds, keeping the folder (made when it is missing, as squaremap does).
 fn empty_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
     let Ok(entries) = std::fs::read_dir(dir) else { return Ok(()) };
     for e in entries {
         let p = e?.path();
@@ -859,22 +986,22 @@ fn empty_dir(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-type Pending = HashMap<(usize, i32, i32), (RegionImage, i32)>;
+/// Regions waiting to be written, with the level's tiles folder they go to.
+type Pending = HashMap<(usize, i32, i32), (RegionImage, i32, Arc<PathBuf>)>;
 
-fn render_loop(rx: mpsc::Receiver<Work>, tiles: PathBuf, in_flight: Arc<AtomicUsize>) {
+fn render_loop(rx: mpsc::Receiver<Work>, in_flight: Arc<AtomicUsize>) {
     let mut regions: Pending = HashMap::new();
     // Per level: saved chunks for biomes next to a snapshot, reopened every DISK_REFRESH.
     let mut disks: HashMap<usize, (DiskCache, Instant)> = HashMap::new();
     let mut last_flush = Instant::now();
-    let save = |world: usize, image: &RegionImage, max_zoom: i32| {
-        let dir = tiles.join(json::web_name(WORLDS[world].0));
-        if let Err(e) = image.save(&dir, max_zoom) {
+    let save = |image: &RegionImage, max_zoom: i32, dir: &Path| {
+        if let Err(e) = image.save(dir, max_zoom) {
             eprintln!("[squaremap] writing region {} {}: {e}", image.rx, image.rz);
         }
     };
     let flush = |regions: &mut Pending| {
-        for ((world, _, _), (image, max_zoom)) in regions.drain() {
-            save(world, &image, max_zoom);
+        for (_, (image, max_zoom, dir)) in regions.drain() {
+            save(&image, max_zoom, dir.as_path());
         }
     };
     loop {
@@ -884,7 +1011,7 @@ fn render_loop(rx: mpsc::Receiver<Work>, tiles: PathBuf, in_flight: Arc<AtomicUs
             Err(mpsc::RecvTimeoutError::Disconnected) => Some(Work::Stop),
         };
         match job {
-            Some(Work::Chunk { world, view, tables, config, region_dir, ids }) => {
+            Some(Work::Chunk { world, view, tables, config, region_dir, tiles, ids }) => {
                 let (cx, cz) = view.chunk();
                 let shape = Shape { min_y: view.min_y(), top_y: view.top_y(), ceiling: view.has_ceiling() };
                 let fresh = |ids: Arc<Ids>| (DiskCache::new((*region_dir).clone(), ids, shape), Instant::now());
@@ -903,11 +1030,11 @@ fn render_loop(rx: mpsc::Receiver<Work>, tiles: PathBuf, in_flight: Arc<AtomicUs
                 let (rx_, rz_) = (cx >> 5, cz >> 5);
                 let entry = regions
                     .entry((world, rx_, rz_))
-                    .or_insert_with(|| (RegionImage::new(rx_, rz_), config.map.zoom.maximum));
+                    .or_insert_with(|| (RegionImage::new(rx_, rz_), config.map.zoom.maximum, tiles));
                 entry.0.put_chunk(cx, cz, &px);
                 in_flight.fetch_sub(1, Ordering::Relaxed);
             }
-            Some(Work::Disk { world, cx, cz, tables, config, region_dir, ids, env }) => {
+            Some(Work::Disk { world, cx, cz, tables, config, region_dir, tiles, ids, env }) => {
                 // A chunk was just saved: its files and decoded neighbours are read afresh (a burst after one save shares
                 // one reading).
                 let shape = shape(world);
@@ -927,22 +1054,22 @@ fn render_loop(rx: mpsc::Receiver<Work>, tiles: PathBuf, in_flight: Arc<AtomicUs
                     let (rx_, rz_) = (cx >> 5, cz >> 5);
                     let entry = regions
                         .entry((world, rx_, rz_))
-                        .or_insert_with(|| (RegionImage::new(rx_, rz_), config.map.zoom.maximum));
+                        .or_insert_with(|| (RegionImage::new(rx_, rz_), config.map.zoom.maximum, tiles));
                     entry.0.put_chunk(cx, cz, &px);
                 }
                 in_flight.fetch_sub(1, Ordering::Relaxed);
             }
-            Some(Work::Region { world, image, max_zoom, unsaved }) => {
+            Some(Work::Region { world, image, max_zoom, unsaved, tiles }) => {
                 // Pending live pixels of the same region are newer: written over it.
-                save(world, &image, max_zoom);
-                if let Some((live, zoom)) = regions.remove(&(world, image.rx, image.rz)) {
-                    save(world, &live, zoom);
+                save(&image, max_zoom, tiles.as_path());
+                if let Some((live, zoom, dir)) = regions.remove(&(world, image.rx, image.rz)) {
+                    save(&live, zoom, dir.as_path());
                 }
                 unsaved.fetch_sub(1, Ordering::Relaxed);
             }
-            Some(Work::Reset { world, done }) => {
+            Some(Work::Reset { world, tiles, done }) => {
                 regions.retain(|(w, _, _), _| *w != world);
-                let _ = done.send(empty_dir(&tiles.join(json::web_name(WORLDS[world].0))));
+                let _ = done.send(empty_dir(tiles.as_path()));
             }
             Some(Work::Stop) => {
                 flush(&mut regions);
@@ -955,5 +1082,59 @@ fn render_loop(rx: mpsc::Receiver<Work>, tiles: PathBuf, in_flight: Arc<AtomicUs
             flush(&mut regions);
             last_flush = Instant::now();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The levels the tests open, in this order (the first open fixes the indexes).
+    const LEVELS_UNDER_TEST: [&str; 4] = ["minecraft:overworld", "minecraft:the_end", "minecraft:the_nether", "mod:castle"];
+
+    fn open(ids: &[&str]) {
+        set_open_levels(&ids.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+    }
+
+    fn open_ids() -> Vec<String> {
+        open_levels().into_iter().map(|(_, id)| id).collect()
+    }
+
+    #[test]
+    fn a_level_keeps_its_index_and_follows_load_and_unload() {
+        let _lock = REGISTRY_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        open(&LEVELS_UNDER_TEST);
+        assert_eq!(open_ids(), ["minecraft:overworld", "minecraft:the_end", "minecraft:the_nether", "mod:castle"]);
+        let castle = world_index("mod:castle").unwrap();
+        // The mod's level unloads: it is no longer open, but it keeps its index and its name.
+        open(&["minecraft:overworld", "minecraft:the_end", "minecraft:the_nether"]);
+        assert_eq!(open_world_index("mod:castle"), None);
+        assert_eq!(world_index("mod:castle"), Some(castle));
+        assert_eq!(world_name(castle), "mod:castle");
+        assert_eq!(open_ids(), ["minecraft:overworld", "minecraft:the_end", "minecraft:the_nether"]);
+        // It loads again.
+        open(&LEVELS_UNDER_TEST);
+        assert_eq!(open_world_index("mod:castle"), Some(castle));
+    }
+
+    #[test]
+    fn a_level_has_its_host_height_and_vanilla_for_the_rest() {
+        let _lock = REGISTRY_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        open(&LEVELS_UNDER_TEST);
+        let nether = world_index("minecraft:the_nether").unwrap();
+        let castle = world_index("mod:castle").unwrap();
+        // Vanilla until the host reports the level.
+        assert!(shape(nether).ceiling);
+        assert_eq!(shape(nether).top_y, 256);
+        // The host's height (`LevelRef.height`): min_y -64, 384 blocks high, no ceiling.
+        level_shape(castle, -64, 320, false);
+        assert_eq!(shape(castle).min_y, -64);
+        assert_eq!(shape(castle).top_y, 320);
+        assert!(!shape(castle).ceiling);
+    }
+
+    #[test]
+    fn an_unknown_index_names_no_level() {
+        assert_eq!(world_name(usize::MAX), "");
     }
 }

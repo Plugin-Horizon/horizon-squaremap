@@ -25,6 +25,10 @@ impl JsonStore {
     pub fn get(&self, path: &str) -> Option<String> {
         self.docs.lock().unwrap().get(path).cloned()
     }
+    /// Forgets the documents under `prefix` (a reset level's `/tiles/<world>/`), as `WebJsonStore.clear` does.
+    pub fn clear(&self, prefix: &str) {
+        self.docs.lock().unwrap().retain(|path, _| !path.starts_with(prefix));
+    }
     /// Writes every document into the web folder (on shutdown, or with the server off).
     pub fn flush(&self, web: &Path) -> io::Result<()> {
         for (path, json) in self.docs.lock().unwrap().iter() {
@@ -185,6 +189,16 @@ fn content_type(file: &Path) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clear_forgets_only_the_prefix() {
+        let store = JsonStore::default();
+        store.put("/tiles/minecraft_the_end/markers.json", "[]".into());
+        store.put("/tiles/minecraft_the_nether/markers.json", "[1]".into());
+        store.clear("/tiles/minecraft_the_end/");
+        assert_eq!(store.get("/tiles/minecraft_the_end/markers.json"), None);
+        assert_eq!(store.get("/tiles/minecraft_the_nether/markers.json").as_deref(), Some("[1]"));
+    }
 
     #[test]
     fn paths_stay_inside_the_web_folder() {

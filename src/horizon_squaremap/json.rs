@@ -3,31 +3,36 @@
 use crate::horizon_squaremap::config::{Config, Layer, WorldConfig};
 use serde_json::{json, Value};
 
-/// The three levels a server has, in the order squaremap lists them.
-pub const WORLDS: [(&str, &str); 3] = [
-    ("minecraft:overworld", "normal"),
-    ("minecraft:the_end", "the_end"),
-    ("minecraft:the_nether", "nether"),
-];
-
 /// `minecraft:overworld` -> `minecraft_overworld` (`WorldIdentifiers.webName`).
 pub fn web_name(world: &str) -> String {
     world.replace(':', "_")
 }
 
-/// `/tiles/settings.json`.
-pub fn settings(config: &Config) -> Value {
+/// squaremap's `WebSettingsPublisher.environment`: the vanilla three, and `custom` for any other level.
+fn environment(id: &str) -> &'static str {
+    match id {
+        "minecraft:overworld" => "normal",
+        "minecraft:the_nether" => "nether",
+        "minecraft:the_end" => "the_end",
+        _ => "custom",
+    }
+}
+
+/// `/tiles/settings.json`: the levels that are open now and have their map enabled, in the order given
+/// (squaremap lists the enabled, loaded worlds).
+pub fn settings(config: &Config, open: &[&str]) -> Value {
     let ui = &config.settings.ui;
-    let worlds: Vec<Value> = WORLDS
+    let worlds: Vec<Value> = open
         .iter()
-        .filter_map(|(id, kind)| {
+        .copied()
+        .filter_map(|id| {
             let w = config.world(id);
             w.map.enabled.then(|| {
                 json!({
                     "name": web_name(id),
                     "icon": w.map.icon,
                     "display_name": w.map.display_name.replace("{world}", id),
-                    "type": kind,
+                    "type": environment(id),
                     "order": w.map.order,
                 })
             })
@@ -208,9 +213,10 @@ mod tests {
     #[test]
     fn documents_have_squaremaps_shape() {
         let c = Config::parse(DEFAULT_TOML).unwrap();
-        let s = settings(&c);
+        let s = settings(&c, &["minecraft:overworld", "minecraft:the_end", "minecraft:the_nether"]);
         assert_eq!(s["worlds"][0]["name"], "minecraft_overworld");
         assert_eq!(s["worlds"][0]["display_name"], "minecraft:overworld");
+        assert_eq!(s["worlds"][1]["type"], "the_end");
         assert_eq!(s["worlds"][2]["type"], "nether");
         let w = c.world("minecraft:overworld");
         let ws = world_settings(&w, [0, 0]);

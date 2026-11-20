@@ -16,7 +16,7 @@ use mod_api::{
     BlockChangedEvent, BlockMetadata, ChunkLoadEvent, ChunkUnloadEvent, Command, CommandArgumentValue, CommandSource,
     HostBlockStates,
     Config, ConfigKind, ConfigLoadingEvent, ConfigReloadingEvent, EquipmentSlot, Flow, HostSide, Hooks, Identifier,
-    LivingRef, NodeDefault, RegistryEntry,
+    LevelLoadEvent, LevelUnloadEvent, LivingRef, NodeDefault, RegistryEntry,
     PermissionGatherNodesEvent, PermissionLevel, PermissionNode, PermissionValueType, PlayerCommandEvent,
     RegisterCommandsEvent, RegisterConfigsEvent, RunModCommandEvent, ServerHost, ServerStartedEvent,
     ServerStoppingEvent, ServerTickEvent, ServerTickPhase, Suggestion, TabCompleteEvent, Text, WorldSavedEvent,
@@ -25,9 +25,6 @@ use mod_api::text::{TextClick, TextHover, TextStyle};
 use std::path::{Path, PathBuf};
 
 const ID: &str = "squaremap";
-
-/// The dimensions squaremap draws, by their registry ids.
-const DIMENSIONS: [&str; 3] = ["minecraft:overworld", "minecraft:the_nether", "minecraft:the_end"];
 
 /// Every permission node the map checks: the subcommands' (`squaremap.command.<sub>`, the ones
 /// `commands::usages` lists) and the two `.others` nodes. Declared in `permission_gather_nodes`.
@@ -196,6 +193,35 @@ fn level_border(host: &mut dyn ServerHost, dimension: &str) -> Option<([f64; 4],
     Some((border, spawn))
 }
 
+/// The ids of the open levels from the host (`Levels::list_levels`), with `add` in it (a level that just opened) and
+/// without `remove` (one that just closed).
+fn open_level_ids(host: &dyn ServerHost, add: Option<&str>, remove: Option<&str>) -> Vec<String> {
+    let mut ids: Vec<String> = host.levels().list_levels().into_iter().map(|l| l.dimension_id().to_owned()).collect();
+    if let Some(a) = add {
+        if !ids.iter().any(|i| i == a) {
+            ids.push(a.to_owned());
+        }
+    }
+    if let Some(r) = remove {
+        ids.retain(|i| i != r);
+    }
+    ids
+}
+
+/// The map's level registry follows the open levels: their ids, their height ranges (`LevelRef.height`), and the
+/// renders a stop interrupted resume. Called at start and whenever a level loads or unloads.
+fn sync_levels(host: &mut dyn ServerHost, add: Option<&str>, remove: Option<&str>) {
+    let ids = open_level_ids(&*host, add, remove);
+    sm::set_open_levels(&ids);
+    for id in &ids {
+        let (Some(w), Some(level)) = (sm::world_index(id), host.level(id)) else { continue };
+        if let Some((min_y, height)) = level.height(&*host) {
+            sm::level_shape(w, min_y, min_y + height, id.as_str() == "minecraft:the_nether");
+        }
+    }
+    sm::resume_renders();
+}
+
 /// The item tag `minecraft:map_invisibility_equipment` (`ItemTags.MAP_INVISIBILITY_EQUIPMENT`).
 const MAP_INVISIBILITY_TAG: &str = "minecraft:map_invisibility_equipment";
 
@@ -339,6 +365,7 @@ impl Hooks for Mod {
     }
 
     fn server_started(&self, host: &mut dyn ServerHost, _: &mut ServerStartedEvent) {
+        sync_levels(host, None, None);
         match render_tables(&*host) {
             Some((states, biomes, env)) => match sm::start(&level_dir(), states, biomes, env) {
                 Ok(()) => log("map started"),
@@ -359,8 +386,11 @@ impl Hooks for Mod {
         if !matches!(event.phase, ServerTickPhase::ServerTickEnd { world_running: true, .. }) || !sm::running() {
             return;
         }
-        for dimension in DIMENSIONS {
-            let Some(w) = sm::world_index(dimension) else { continue };
+        for (w, dimension) in sm::open_levels() {
+            // A level whose map is disabled is not drawn and publishes nothing.
+            if !sm::world_enabled(w) {
+                continue;
+            }
             // TODO(arismoko-api: chunk_snapshot): loaded chunks are not snapshotted. A changed chunk that is still
             // loaded is drawn from the region files once the next world save has written it (`world_saved`); one
             // that was unloaded meanwhile is drawn from them at once.
@@ -368,7 +398,7 @@ impl Hooks for Mod {
                 sm::due_chunk(w, cx, cz);
             }
             if sm::markers_due(w) {
-                if let Some((border, spawn)) = level_border(host, dimension) {
+                if let Some((border, spawn)) = level_border(host, &dimension) {
                     sm::publish_markers(w, spawn, border);
                 }
             }
@@ -381,6 +411,16 @@ impl Hooks for Mod {
     /// A world save wrote the loaded chunks to the region files: the changed ones that waited for it are drawn.
     fn world_saved(&self, _: &mut dyn ServerHost, _: &mut WorldSavedEvent) {
         sm::world_saved();
+    }
+
+    /// A level opened (before its first chunk): it joins the registry, and its map is set up if it is enabled.
+    fn level_load(&self, host: &mut dyn ServerHost, event: &mut LevelLoadEvent<'_>) {
+        sync_levels(host, Some(event.dimension), None);
+    }
+
+    /// A level closed after its last save: it leaves the registry (its index and queued work stay).
+    fn level_unload(&self, host: &mut dyn ServerHost, event: &mut LevelUnloadEvent<'_>) {
+        sync_levels(host, None, Some(event.dimension));
     }
 
     fn chunk_load(&self, _: &mut dyn ServerHost, e: &mut ChunkLoadEvent<'_>) {

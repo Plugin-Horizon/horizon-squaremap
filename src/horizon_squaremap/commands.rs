@@ -2,7 +2,6 @@
 //! nodes, English messages, colours, hovers and clicks (`Messages`; MIT, Copyright (c) 2021-2024
 //! Jason Penilla and Contributors). The game side hands over the line and who sent it, and sends
 //! the returned lines back (`glue.rs`).
-use crate::horizon_squaremap::json::WORLDS;
 use crate::horizon_squaremap::render::{Mode, PROGRESS_INTERVAL, PROGRESS_LOGGING};
 use crate::horizon_squaremap::runtime::{self, RenderRefused};
 use std::collections::HashMap;
@@ -324,13 +323,15 @@ fn mixed_local_absolute() -> Line {
     ))
 }
 
-fn world_id(w: usize) -> &'static str {
-    WORLDS[w].0
+/// The level's identifier (`minecraft:the_nether`, `mod:castle`), "" for an index the map does not know.
+fn world_id(w: usize) -> String {
+    runtime::world_name(w)
 }
 
 /// Why a render command was refused, worded as squaremap words it.
 fn refused(e: RenderRefused, w: usize) -> Line {
-    let id = world_id(w);
+    let name = world_id(w);
+    let id = name.as_str();
     match e {
         RenderRefused::InProgress => msg(tr("render-in-progress", "A render is already in progress on <world>", &[("world", id)]), RED),
         RenderRefused::NotInProgress => msg(tr("render-not-in-progress", "No renders running for <world>", &[("world", id)]), RED),
@@ -456,11 +457,12 @@ const HELP: [HelpEntry; 16] = [
     HelpEntry { syntax: "show <player>", key: "command.description.show", description: "Show a player on the map view", args: &[PLAYER_ARG] },
 ];
 
-/// A level by its identifier (`MapWorldParser`): `minecraft:the_nether`, or `the_nether` in the
-/// `minecraft` namespace. Other spellings (`nether`) name no level.
+/// An open level by its identifier (`LevelParser`): `minecraft:the_nether`, `the_nether` in the `minecraft`
+/// namespace, or a mod's `mod:castle`. Other spellings (`nether`) name no level, and a level that is not loaded
+/// names none either.
 pub fn parse_world(s: &str) -> Option<usize> {
     let id = if s.contains(':') { s.to_owned() } else { format!("minecraft:{s}") };
-    runtime::world_index(&id)
+    runtime::open_world_index(&id)
 }
 
 /// Runs a map command line (without its slash); `online` lists the players as (UUID, name)
@@ -482,7 +484,7 @@ pub fn command(line: &str, sender: &Sender, online: &[(u128, String)]) -> Vec<Li
             Err(e) => vec![e],
             Ok(w) => match runtime::start_full_render(w) {
                 Ok(()) if sender.player.is_some() => {
-                    vec![plain(tr("log.started-full-render", "Started full map render for <world>", &[("world", world_id(w))]))]
+                    vec![plain(tr("log.started-full-render", "Started full map render for <world>", &[("world", world_id(w).as_str())]))]
                 }
                 Ok(()) => vec![],
                 Err(e) => vec![refused(e, w)],
@@ -492,16 +494,16 @@ pub fn command(line: &str, sender: &Sender, online: &[(u128, String)]) -> Vec<Li
         "cancelrender" => match world_arg(args.first().copied(), sender) {
             Err(e) => vec![e],
             Ok(w) => match runtime::cancel_render(w) {
-                Ok(()) => vec![msg(tr("cancelled-render", "Render cancelled for <world>", &[("world", world_id(w))]), GREEN)],
+                Ok(()) => vec![msg(tr("cancelled-render", "Render cancelled for <world>", &[("world", world_id(w).as_str())]), GREEN)],
                 Err(e) => vec![refused(e, w)],
             },
         },
         "pauserender" => match world_arg(args.first().copied(), sender) {
             Err(e) => vec![e],
             Ok(w) => match runtime::toggle_pause(w) {
-                Some(true) => vec![msg(tr("paused-renders", "Paused renders for <world>", &[("world", world_id(w))]), GREEN)],
-                Some(false) => vec![msg(tr("unpaused-renders", "Unpaused renders for <world>", &[("world", world_id(w))]), GREEN)],
-                None => vec![refused(RenderRefused::NotRunning, w)],
+                Ok(true) => vec![msg(tr("paused-renders", "Paused renders for <world>", &[("world", world_id(w).as_str())]), GREEN)],
+                Ok(false) => vec![msg(tr("unpaused-renders", "Unpaused renders for <world>", &[("world", world_id(w).as_str())]), GREEN)],
+                Err(e) => vec![refused(e, w)],
             },
         },
         "resetmap" => reset_request(args, sender, line),
@@ -658,7 +660,7 @@ fn fill_description(text: &str) -> String {
 fn world_arg(arg: Option<&str>, sender: &Sender) -> Result<usize, Line> {
     match (arg, sender.player.as_ref()) {
         (Some(a), _) => parse_world(a).ok_or_else(|| no_such_world(a)),
-        (None, Some(p)) => runtime::world_index(&p.world)
+        (None, Some(p)) => runtime::open_world_index(&p.world)
             .ok_or_else(|| {
                 error(vec![colored(
                     tr("command.message.map-not-enabled-for-world", "Map is not enabled for world '<world>'", &[("world", &p.world)]),
@@ -733,7 +735,7 @@ fn radius(args: &[&str], sender: &Sender) -> Vec<Line> {
         _ => return vec![invalid_syntax("radiusrender <world> <radius> [center]")],
     };
     match runtime::start_radius_render(w, center, r) {
-        Ok(()) => vec![plain(tr("log.started-radius-render", "Started radius map render for <world>", &[("world", world_id(w))]))],
+        Ok(()) => vec![plain(tr("log.started-radius-render", "Started radius map render for <world>", &[("world", world_id(w).as_str())]))],
         Err(e) => vec![refused(e, w)],
     }
 }
@@ -774,7 +776,7 @@ fn confirm(sender: &Sender, online: &[(u128, String)]) -> Vec<Line> {
         return command(&line, sender, online);
     };
     match runtime::reset_map(w) {
-        Ok(()) => vec![msg(tr("successfully-reset-map", "Successfully reset map for <world>", &[("world", world_id(w))]), GREEN)],
+        Ok(()) => vec![msg(tr("successfully-reset-map", "Successfully reset map for <world>", &[("world", world_id(w).as_str())]), GREEN)],
         Err(e) => vec![msg(e, RED)],
     }
 }
@@ -878,9 +880,9 @@ fn link(sender: &Sender) -> Line {
     ])
 }
 
-/// The completions of the world argument (the first one) of the commands that take a world:
-/// the level identifiers, and the short name of the `minecraft` ones once something is typed
-/// (`MapWorldParser`'s suggestions). Empty for any other line.
+/// The completions of the world argument (the first one) of the commands that take a world: the open levels'
+/// identifiers, and the short name of the `minecraft` ones once something is typed (`MapWorldParser`'s
+/// suggestions, which list the enabled ones). Empty for any other line.
 pub fn world_completions(command: &str) -> Vec<String> {
     const WORLD_SUBS: [&str; 5] = ["fullrender", "radiusrender", "cancelrender", "pauserender", "resetmap"];
     let words: Vec<&str> = command.split(' ').collect();
@@ -888,10 +890,15 @@ pub fn world_completions(command: &str) -> Vec<String> {
         return Vec::new();
     }
     let typed = words[2].to_ascii_lowercase();
+    // `resetmap` names any open level; the others only those whose map is enabled (`MapWorldParser`).
+    let resetmap = words[1].eq_ignore_ascii_case("resetmap");
     let mut out = Vec::new();
-    for (id, _) in WORLDS {
-        let short = id.strip_prefix("minecraft:").unwrap_or(id);
-        let candidates: Vec<&str> = if typed.is_empty() { vec![id] } else { vec![short, id] };
+    for (_, id) in runtime::open_levels() {
+        if !resetmap && !runtime::config().world(&id).map.enabled {
+            continue;
+        }
+        let short = id.strip_prefix("minecraft:").unwrap_or(id.as_str());
+        let candidates: Vec<&str> = if typed.is_empty() { vec![id.as_str()] } else { vec![short, id.as_str()] };
         out.extend(
             candidates
                 .into_iter()
@@ -905,11 +912,12 @@ pub fn world_completions(command: &str) -> Vec<String> {
 /// A one-line status of each level's render, for operators (`/squaremap` has no status
 /// command; used by the game side's log if wanted).
 pub fn status_lines() -> Vec<String> {
-    (0..WORLDS.len())
-        .filter_map(|w| {
+    runtime::open_levels()
+        .into_iter()
+        .filter_map(|(w, id)| {
             runtime::render_status(w).map(|(mode, done, total, paused)| {
                 let m = if mode == Mode::Full { "full" } else { "radius" };
-                format!("{}: {m} render {done}/{total} chunks{}", WORLDS[w].0, if paused { " (paused)" } else { "" })
+                format!("{id}: {m} render {done}/{total} chunks{}", if paused { " (paused)" } else { "" })
             })
         })
         .collect()
@@ -959,32 +967,49 @@ mod tests {
         assert_eq!(others_node("squaremap reload"), None);
     }
 
+    /// Opens the levels the tests use: the vanilla three and a mod's level. The registry is process-wide, so the
+    /// tests that read it hold [`runtime::REGISTRY_TESTS`] and open this same list.
+    fn open_test_levels() -> std::sync::MutexGuard<'static, ()> {
+        let guard = runtime::REGISTRY_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        runtime::set_open_levels(&["minecraft:overworld", "minecraft:the_end", "minecraft:the_nether", "mod:castle"].map(String::from));
+        guard
+    }
+
     #[test]
     fn worlds_and_coordinates() {
-        assert_eq!(parse_world("minecraft:the_nether"), Some(2));
-        assert_eq!(parse_world("the_nether"), Some(2));
-        assert_eq!(parse_world("minecraft:overworld"), Some(0));
-        assert_eq!(parse_world("minecraft:the_end"), Some(1));
+        let _levels = open_test_levels();
+        let nether = parse_world("minecraft:the_nether");
+        assert!(nether.is_some());
+        assert_eq!(parse_world("the_nether"), nether);
+        assert_eq!(nether.map(runtime::world_name).as_deref(), Some("minecraft:the_nether"));
+        assert_eq!(parse_world("mod:castle").map(runtime::world_name).as_deref(), Some("mod:castle"));
+        assert_eq!(parse_world("castle"), None);
         assert_eq!(parse_world("nether"), None);
         assert_eq!(parse_world("mars"), None);
         assert_eq!(coord("~", 100.7), Some(100));
         assert_eq!(coord("~-5", 0.5), Some(-5));
         assert_eq!(coord("-3.5", 0.0), Some(-4));
         assert_eq!(coord("~", 0.0), Some(0));
-        assert_eq!(world_arg(None, &player(2)).ok(), Some(2));
+        assert_eq!(world_arg(None, &player(2)).ok(), nether);
         assert!(world_arg(None, &console()).is_err());
     }
 
     #[test]
     fn world_names_for_the_first_argument() {
-        assert_eq!(world_completions("/squaremap fullrender "), ["minecraft:overworld", "minecraft:the_end", "minecraft:the_nether"]);
+        let _levels = open_test_levels();
+        assert_eq!(
+            world_completions("/squaremap fullrender "),
+            ["minecraft:overworld", "minecraft:the_end", "minecraft:the_nether", "mod:castle"]
+        );
         assert_eq!(world_completions("map resetmap the"), ["the_end", "the_nether"]);
+        assert_eq!(world_completions("map resetmap mod"), ["mod:castle"]);
         assert!(world_completions("squaremap hide ").is_empty());
         assert!(world_completions("squaremap fullrender minecraft:the_end ").is_empty());
     }
 
     #[test]
     fn messages_without_a_running_map() {
+        let _levels = open_test_levels();
         assert_eq!(
             texts(&command("squaremap fullrender", &player(0), &[])),
             ["I'm sorry, but you do not have permission to perform this command.\nPlease contact the server administrators if you believe that this is in error."]
@@ -1066,6 +1091,7 @@ mod tests {
 
     #[test]
     fn resetmap_asks_then_confirm_runs_it() {
+        let _levels = open_test_levels();
         assert_eq!(texts(&command("squaremap resetmap minecraft:the_end", &console(), &[])), ["Confirmation required. Confirm using /squaremap confirm."]);
         // Without the runtime the reset cannot run.
         assert_eq!(texts(&command("squaremap confirm", &console(), &[])), ["the map has not started"]);
