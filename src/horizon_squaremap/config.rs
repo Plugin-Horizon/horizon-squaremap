@@ -18,6 +18,8 @@ pub struct Config {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
 pub struct Settings {
+    pub debug_mode: bool,
+    pub update_checker: bool,
     /// The language file under `plugins/squaremap/locale/` (`settings.language-file`).
     pub language_file: String,
     pub web_address: String,
@@ -72,6 +74,7 @@ pub struct Webserver {
     pub enabled: bool,
     pub bind: String,
     pub port: u16,
+    pub flush_json_immediately: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -270,6 +273,8 @@ impl Default for Config {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            debug_mode: false,
+            update_checker: true,
             language_file: "lang-en.yml".into(),
             web_address: "http://localhost:8080".into(),
             web_directory: WebDirectory { path: "squaremap/web".into(), auto_update: true },
@@ -302,7 +307,7 @@ impl Default for WebDirectory {
 
 impl Default for Webserver {
     fn default() -> Self {
-        Self { enabled: true, bind: "127.0.0.1".into(), port: 8080 }
+        Self { enabled: true, bind: "127.0.0.1".into(), port: 8080, flush_json_immediately: false }
     }
 }
 
@@ -338,6 +343,9 @@ impl Default for WorldConfig {
                 "minecraft:fern",
                 "minecraft:short_grass",
                 "minecraft:large_fern",
+                "minecraft:bush",
+                "minecraft:short_dry_grass",
+                "minecraft:tall_dry_grass",
             ]
             .map(String::from)
             .to_vec(),
@@ -564,6 +572,16 @@ impl MapConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rust_defaults_match_the_original() {
+        let w = WorldConfig::default();
+        assert_eq!(w.invisible_blocks.len(), 7);
+        assert!(w.invisible_blocks.contains(&"minecraft:tall_dry_grass".to_string()));
+        let c = Config::parse("[settings]\ndebug-mode = true\nupdate-checker = false\n[settings.internal-webserver]\nflush-json-immediately = true\n").unwrap();
+        assert!(c.settings.debug_mode && !c.settings.update_checker);
+        assert!(c.settings.internal_webserver.flush_json_immediately);
+    }
 
     #[test]
     fn default_file_has_the_server_values() {

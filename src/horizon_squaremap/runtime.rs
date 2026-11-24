@@ -108,6 +108,7 @@ struct Runtime {
     in_flight: Arc<AtomicUsize>,
     json: Arc<JsonStore>,
     server: Option<WebServer>,
+    flush_json_immediately: bool,
     next_players: Instant,
     players: String,
 }
@@ -319,6 +320,7 @@ fn start_with(args: StartArgs) -> Result<(), String> {
         in_flight,
         json,
         server,
+        flush_json_immediately: config.settings.internal_webserver.flush_json_immediately,
         next_players: now,
         players: String::new(),
     };
@@ -802,9 +804,9 @@ fn write_icon_into(web: &Path, key: &str, png: &[u8]) {
 
 impl Runtime {
     fn put(&self, path: &str, doc: String) {
-        self.json.put(path, doc);
-        if self.server.is_none() {
-            let _ = self.json.flush(&self.web);
+        // Written at once with `flush-json-immediately` or with the web server off (`WebJsonStore.put`).
+        if self.json.put(path, doc) && (self.flush_json_immediately || self.server.is_none()) {
+            let _ = self.json.flush_one(&self.web, path);
         }
     }
 
