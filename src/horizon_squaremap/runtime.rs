@@ -672,6 +672,10 @@ pub fn publish_markers(world: usize, spawn: Option<[i32; 2]>, border: [f64; 4]) 
         let settings = json::world_settings(&w.config, spawn.unwrap_or_default()).to_string();
         let mut layers = json::markers(&w.config, spawn, border, now_millis());
         if let serde_json::Value::Array(list) = &mut layers {
+            // ChunkyBorder's layer takes the place of squaremap's own border while it exists.
+            if crate::horizon_squaremap::api::has_layer(&w.id, "chunky") {
+                list.retain(|l| l["id"] != "squaremap-worldborder");
+            }
             list.extend(crate::horizon_squaremap::api::layers_json(&w.id));
         }
         rt.put(&format!("/tiles/{name}/settings.json"), settings);

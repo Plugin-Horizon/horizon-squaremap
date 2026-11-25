@@ -10,6 +10,7 @@
 //! `serverconfig/squaremap-server.toml` wins). The web server binds 127.0.0.1 by default.
 
 pub mod horizon_squaremap;
+mod chunky_border;
 use horizon_squaremap as sm;
 use mod_api::{
     BlockChangedEvent, BlockMetadata, ChunkLoadEvent, ChunkUnloadEvent, Command, CommandArgumentValue, CommandSource,
@@ -19,13 +20,46 @@ use mod_api::{
     PermissionGatherNodesEvent, PermissionLevel, PermissionNode, PermissionValueType, PlayerCommandEvent,
     RegisterCommandsEvent, RegisterNodeCommandsEvent, RegisterConfigsEvent, RunModCommandEvent, ServerHost, ServerStartedEvent,
     ChunkRef, Heightmap, LevelRef, LevelTickPreEvent,
-    ServerStoppingEvent, ServerTickEvent, ServerTickPhase, Suggestion, TabCompleteEvent, Text, WorldSavedEvent,
+    ModServiceCallEvent, ServerStoppingEvent, ServerTickEvent, ServerTickPhase, Suggestion, TabCompleteEvent, Text, WorldSavedEvent,
 };
 use mod_api::text::{TextClick, TextHover, TextStyle};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 const ID: &str = "squaremap";
+
+/// Whether the chunky mod has accepted `subscribe squaremap` (its border events then arrive at `squaremap:chunky_event`).
+static CHUNKY_SUBSCRIBED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Ticks between two tries to subscribe while the chunky mod is absent (five seconds).
+const SUBSCRIBE_EVERY: u64 = 100;
+
+/// ChunkyBorder's `map-options`, read when a border is drawn (`config/chunkyborder/config.yml` or `.toml`).
+fn border_options() -> chunky_border::Options {
+    let dir = Path::new("config/chunkyborder");
+    let text = std::fs::read_to_string(dir.join("config.toml")).or_else(|_| std::fs::read_to_string(dir.join("config.yml")));
+    text.map(|t| chunky_border::Options::parse(&t)).unwrap_or_default()
+}
+
+/// Subscribes to the chunky mod's border events once it is there, and draws the borders it already has.
+/// Every failure (no such mod, no such service) is silent and tried again later.
+fn subscribe_to_chunky(host: &mut dyn ServerHost) {
+    use std::sync::atomic::Ordering;
+    if CHUNKY_SUBSCRIBED.load(Ordering::Relaxed) {
+        return;
+    }
+    if host.commands().call_mod_service("chunky:api", format!("subscribe\t{ID}").as_bytes()).is_err() {
+        return;
+    }
+    CHUNKY_SUBSCRIBED.store(true, Ordering::Relaxed);
+    let options = border_options();
+    for (_, dimension) in sm::open_levels() {
+        let line = format!("border_get\t{}", chunky_border::world_of(&dimension));
+        let Ok(reply) = host.commands().call_mod_service("chunky:api", line.as_bytes()) else { continue };
+        let Ok(reply) = String::from_utf8(reply) else { continue };
+        let fields: Vec<&str> = reply.trim().split('\t').collect();
+        chunky_border::apply(&dimension, chunky_border::parse_border(&fields).as_ref(), &options);
+    }
+}
 
 /// Every permission node the map checks: the subcommands' (`squaremap.command.<sub>`, the ones
 /// `commands::usages` lists) and the two `.others` nodes. Declared in `permission_gather_nodes`.
@@ -499,7 +533,31 @@ impl Hooks for Mod {
         sm::world_closed();
     }
 
+    /// The service other mods call: `squaremap:chunky_event`, one event line of the chunky mod (a border that changed
+    /// or went away is drawn or removed as a layer).
+    fn mod_service_call(&self, _: &mut dyn ServerHost, event: &mut ModServiceCallEvent<'_>) -> Option<mod_api::PayloadBytes> {
+        if event.service != "squaremap:chunky_event" {
+            return None;
+        }
+        let line = std::str::from_utf8(&event.payload.0).ok()?;
+        if let Some((world, border)) = chunky_border::parse_event(line)
+            && let Some(dimension) = chunky_border::dimension_of(&world)
+        {
+            chunky_border::apply(&dimension, border.as_ref(), &border_options());
+        }
+        Some(mod_api::PayloadBytes(b"ok".to_vec()))
+    }
+
     fn server_tick(&self, host: &mut dyn ServerHost, event: &mut ServerTickEvent<'_>) {
+        if let ServerTickPhase::ServerTickEnd { world_running: true, .. } = event.phase
+            && !CHUNKY_SUBSCRIBED.load(std::sync::atomic::Ordering::Relaxed)
+            && sm::running()
+        {
+            static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            if CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % SUBSCRIBE_EVERY == 0 {
+                subscribe_to_chunky(host);
+            }
+        }
         if !matches!(event.phase, ServerTickPhase::ServerTickEnd { world_running: true, .. }) || !sm::running() {
             return;
         }
