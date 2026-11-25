@@ -30,7 +30,7 @@ This is a native trait mod: `horizon-mod.toml`, a `Cargo.toml` that depends on `
 - **What gets rendered.** Newly generated chunks (squaremap's `ChunkPopulateEvent`) and
   chunks whose blocks change (`Level.setBlock`), in batches every
   `render.background.interval-seconds`, at most `max-chunks-per-interval` per batch.
-  A changed chunk is redrawn from the region files: right away when it unloaded, else after the next world save (the changed blocks are not on disk before).
+  A changed chunk that is loaded is redrawn at once from a snapshot of its sections and heights and its eight neighbours (`chunk_sections`, `chunk.heightmap`), as it ticks; one that unloaded is drawn from the region files once its save is newer than its change (`level.saved_chunk_modified`). A loaded chunk that cannot be snapshotted waits for the next world save.
 - **Full and radius renders** (`/squaremap fullrender`, `radiusrender`): the chunks already
   saved in the world's region files (`dimensions/<ns>/<level>/region/r.<x>.<z>.mca`) are
   read and drawn on a thread of their own, region by region in squaremap's spiral order;
@@ -110,9 +110,8 @@ horizon-launcher native-build <path to this folder> --server-output <dir> --vers
 
 ## Known gaps
 
-What does not work yet (one gap needs an engine API; see `audit/rec100/ENGINE_NEEDS.md`):
+What does not work yet (no engine API is missing):
 
-- Loaded chunks are not snapshotted (the live chunk read of `chunk_sections` is only on the `rec-world-data` branch and gives no heightmaps): a changed chunk that is still loaded is redrawn from the region files after the next world save (one that unloaded, at once), so the live map follows the save, not the block change.
 - `/squaremap help` follows cloud-minecraft-extras' paged help from memory (title bar and page arrows may differ in detail); that library is not part of squaremap's source.
 - `settings.update-checker` is read and does nothing (see Not ported).
 

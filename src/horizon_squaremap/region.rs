@@ -296,6 +296,14 @@ impl Ids {
         self.states.get(&key).or_else(|| self.blocks.get(&name)).copied().unwrap_or(u32::MAX)
     }
 
+    /// The state id of a block state as the host writes it (`minecraft:oak_stairs[facing=north,half=bottom]`); an
+    /// unknown state falls back to its block's first state, an unknown block is air ([`u32::MAX`]).
+    pub fn state_text(&self, text: &str) -> u32 {
+        let (name, mut props) = crate::horizon_squaremap::vanilla::parse_state(text);
+        let key = state_key(&name, &mut props);
+        self.states.get(&key).or_else(|| self.blocks.get(&name)).copied().unwrap_or(u32::MAX)
+    }
+
     fn is_air(&self, id: u32) -> bool {
         self.air.get(id as usize).copied().unwrap_or(true)
     }
@@ -379,6 +387,26 @@ struct Section {
     biomes: Paletted<u16>,
 }
 
+/// A section of a loaded chunk as the engine reports it (the SDK's `SectionData`, without light).
+pub struct LiveSection {
+    /// The section's y (block y `y * 16`).
+    pub y: i32,
+    /// Block states as the host writes them, in order of first use.
+    pub block_palette: Vec<String>,
+    /// 4096 indexes into `block_palette`, `(y << 8) | (z << 4) | x`.
+    pub blocks: Vec<u16>,
+    pub biome_palette: Vec<String>,
+    /// 64 indexes into `biome_palette`, `(y << 4) | (z << 2) | x`.
+    pub biomes: Vec<u8>,
+}
+
+/// Indexes packed `bits` each, none across two longs (the saved layout).
+fn pack_indexes(values: impl Iterator<Item = u64>, bits: u32) -> Vec<i64> {
+    let per = (64 / bits) as usize;
+    let values: Vec<u64> = values.collect();
+    values.chunks(per).map(|c| c.iter().enumerate().fold(0u64, |w, (i, &v)| w | v << (i as u32 * bits)) as i64).collect()
+}
+
 /// One saved chunk, as the scanner reads it.
 #[derive(Debug)]
 pub struct DiskChunk {
@@ -442,6 +470,39 @@ impl DiskChunk {
             })
             .unwrap_or_else(|| chunk.compute_surface(ids, shape));
         Ok(Some(chunk))
+    }
+
+    /// A loaded chunk from its sections and its `WORLD_SURFACE` heights (`chunk.heightmap`: the y one above the highest
+    /// block of each column, `z * 16 + x`; a chunk without them gets the heights from the blocks).
+    pub fn from_live(sections: Vec<LiveSection>, heights: Option<&[i16]>, ids: &Ids, shape: Shape) -> Result<DiskChunk, String> {
+        let min_section = shape.min_y >> 4;
+        let count = ((shape.top_y - shape.min_y) >> 4).max(0) as usize;
+        let mut slots: Vec<Option<Section>> = (0..count).map(|_| None).collect();
+        for s in sections {
+            let Some(slot) = usize::try_from(s.y - min_section).ok().filter(|&i| i < count) else { continue };
+            if s.block_palette.is_empty() || s.blocks.len() != 4096 || s.biomes.len() != 64 {
+                continue;
+            }
+            let palette: Vec<u32> = s.block_palette.iter().map(|t| ids.state_text(t)).collect();
+            let bits = ceil_log2(palette.len()).max(4);
+            let data = (palette.len() > 1).then(|| pack_indexes(s.blocks.iter().map(|&v| u64::from(v)), bits));
+            let states = Paletted::new(palette, data.as_deref(), 4096, 4)?;
+            let biome_palette: Vec<u16> = if s.biome_palette.is_empty() {
+                vec![ids.biome("minecraft:plains")]
+            } else {
+                s.biome_palette.iter().map(|n| ids.biome(n)).collect()
+            };
+            let biome_bits = ceil_log2(biome_palette.len()).max(1);
+            let biome_data = (biome_palette.len() > 1).then(|| pack_indexes(s.biomes.iter().map(|&v| u64::from(v)), biome_bits));
+            let biomes = Paletted::new(biome_palette, biome_data.as_deref(), 64, 0)?;
+            slots[slot] = Some(Section { states, biomes });
+        }
+        let mut chunk = DiskChunk { min_section, sections: slots, surface: Vec::new() };
+        chunk.surface = match heights {
+            Some(h) if h.len() == 256 => h.iter().map(|&v| i32::from(v)).collect(),
+            _ => chunk.compute_surface(ids, shape),
+        };
+        Ok(chunk)
     }
 
     /// The heightmap from the blocks (a chunk saved without one).
@@ -612,6 +673,13 @@ impl DiskView {
             return None;
         }
         self.chunks[((dz + 1) * 3 + dx + 1) as usize].as_deref()
+    }
+}
+
+impl DiskView {
+    /// A chunk and its eight neighbours (row by row from the north-west), the centre first among them being index 4.
+    pub fn new(cx: i32, cz: i32, chunks: [Option<Arc<DiskChunk>>; 9], shape: Shape, env: Arc<WorldEnv>) -> DiskView {
+        DiskView { cx, cz, chunks, shape, env }
     }
 }
 
@@ -804,6 +872,35 @@ mod tests {
     }
 
     const OVERWORLD: Shape = Shape { min_y: -64, top_y: 320, ceiling: false };
+
+    #[test]
+    fn a_loaded_chunk_reads_like_a_saved_one() {
+        // Section 0 (y 0..15): stone below y 8, a log with axis y at (1, 9, 2), air elsewhere; two biomes.
+        let blocks: Vec<u16> = (0..4096)
+            .map(|i| {
+                let (x, y, z) = (i & 15, i >> 8, (i >> 4) & 15);
+                if (x, y, z) == (1, 9, 2) { 2 } else if y < 8 { 1 } else { 0 }
+            })
+            .collect();
+        let section = LiveSection {
+            y: 0,
+            block_palette: vec!["minecraft:air".into(), "minecraft:stone".into(), "minecraft:oak_log[axis=y]".into()],
+            blocks,
+            biome_palette: vec!["minecraft:plains".into(), "minecraft:desert".into()],
+            biomes: (0..64).map(|i| u8::from(i % 4 == 3)).collect(),
+        };
+        let mut heights = vec![8i16; 256];
+        heights[(2 * 16 + 1) as usize] = 10;
+        let c = DiskChunk::from_live(vec![section], Some(&heights), &ids(), OVERWORLD).unwrap();
+        assert_eq!((c.state(0, 7, 0), c.state(0, 8, 0), c.state(1, 9, 2)), (1, 0, 3));
+        assert_eq!((c.surface(1, 2), c.surface(0, 0)), (10, 8));
+        assert_eq!((c.biome(0, 0, 0), c.biome(3, 0, 0)), (Some(0), Some(1)));
+        // A column with no height gets it from the blocks.
+        let section = LiveSection { y: 0, block_palette: vec!["minecraft:stone".into()], blocks: vec![0; 4096], biome_palette: vec![], biomes: vec![0; 64] };
+        let c = DiskChunk::from_live(vec![section], None, &ids(), OVERWORLD).unwrap();
+        assert_eq!((c.state(5, 15, 5), c.surface(5, 5), c.biome(0, 0, 0)), (1, 16, Some(0)));
+    }
+
 
     #[test]
     fn decodes_palette_properties_biomes_and_computed_heights() {

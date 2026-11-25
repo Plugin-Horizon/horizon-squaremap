@@ -18,10 +18,12 @@ use mod_api::{
     LevelLoadEvent, LevelUnloadEvent, LivingRef, NodeDefault, RegistryEntry,
     PermissionGatherNodesEvent, PermissionLevel, PermissionNode, PermissionValueType, PlayerCommandEvent,
     RegisterCommandsEvent, RegisterNodeCommandsEvent, RegisterConfigsEvent, RunModCommandEvent, ServerHost, ServerStartedEvent,
+    ChunkRef, Heightmap, LevelRef, LevelTickPreEvent,
     ServerStoppingEvent, ServerTickEvent, ServerTickPhase, Suggestion, TabCompleteEvent, Text, WorldSavedEvent,
 };
 use mod_api::text::{TextClick, TextHover, TextStyle};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 const ID: &str = "squaremap";
 
@@ -384,6 +386,78 @@ fn line_text(line: &sm::commands::Line) -> Text {
     text
 }
 
+/// The chunks decoded for this level tick: a due chunk's snapshot shares its neighbours with the next one's.
+#[derive(Default)]
+struct ChunkCache {
+    chunks: std::collections::HashMap<(i32, i32), Option<Arc<sm::region::DiskChunk>>>,
+}
+
+/// A loaded chunk as the scanner reads it: its sections and `WORLD_SURFACE` heights, decoded once per tick.
+fn decode_loaded(
+    host: &dyn ServerHost,
+    level: LevelRef,
+    cx: i32,
+    cz: i32,
+    ids: &sm::region::Ids,
+    shape: sm::region::Shape,
+    cache: &mut ChunkCache,
+) -> Option<Arc<sm::region::DiskChunk>> {
+    if let Some(hit) = cache.chunks.get(&(cx, cz)) {
+        return hit.clone();
+    }
+    let chunk = ChunkRef::new(level, [cx, cz]);
+    let decoded = chunk.sections(host).and_then(|sections| {
+        let sections = sections
+            .into_iter()
+            .map(|s| sm::region::LiveSection {
+                y: s.y,
+                block_palette: s.block_palette,
+                blocks: s.blocks,
+                biome_palette: s.biome_palette,
+                biomes: s.biomes,
+            })
+            .collect();
+        let heights = chunk.heightmap(host, Heightmap::WorldSurface);
+        sm::region::DiskChunk::from_live(sections, heights.as_deref(), ids, shape).ok().map(Arc::new)
+    });
+    if cache.chunks.len() >= 64 {
+        cache.chunks.clear();
+    }
+    cache.chunks.insert((cx, cz), decoded.clone());
+    decoded
+}
+
+/// One due chunk of level `w`: see `level_tick_pre`.
+fn draw_due_chunk(host: &mut dyn ServerHost, level: LevelRef, w: usize, cx: i32, cz: i32, cache: &mut ChunkCache) {
+    if sm::is_loaded(w, cx, cz) {
+        if let Some((ids, env)) = sm::snapshot_tables() {
+            let shape = sm::level_shape_of(w);
+            let centre = decode_loaded(&*host, level, cx, cz, &ids, shape, cache);
+            if centre.is_some() {
+                let chunks = std::array::from_fn(|i| {
+                    let (dx, dz) = (i as i32 % 3 - 1, i as i32 / 3 - 1);
+                    if (dx, dz) == (0, 0) { centre.clone() } else { decode_loaded(&*host, level, cx + dx, cz + dz, &ids, shape, cache) }
+                });
+                sm::drawn(w, cx, cz);
+                sm::submit(w, Box::new(sm::region::DiskView::new(cx, cz, chunks, shape, env)));
+                return;
+            }
+        }
+        // No snapshot: the chunk is drawn from the region files after the next world save.
+        sm::due_chunk(w, cx, cz);
+        return;
+    }
+    // Unloaded: its save may still wait for the region writer; draw it once the save is as new as the change.
+    let changed = sm::changed_second(w, cx, cz);
+    match level.saved_chunk_modified(&*host, [cx, cz]) {
+        Some(saved) if saved < changed => sm::redirty(w, cx, cz),
+        _ => {
+            sm::drawn(w, cx, cz);
+            sm::due_chunk(w, cx, cz);
+        }
+    }
+}
+
 #[derive(Default)]
 struct Mod;
 
@@ -434,12 +508,6 @@ impl Hooks for Mod {
             if !sm::world_enabled(w) {
                 continue;
             }
-            // HMOD-GAP(chunk_snapshot): loaded chunks are not snapshotted. A changed chunk that is still
-            // loaded is drawn from the region files once the next world save has written it (`world_saved`); one
-            // that was unloaded meanwhile is drawn from them at once.
-            for (cx, cz) in sm::due_chunks(w) {
-                sm::due_chunk(w, cx, cz);
-            }
             if sm::markers_due(w) {
                 if let Some((border, spawn)) = level_border(host, &dimension) {
                     sm::publish_markers(w, spawn, border);
@@ -448,6 +516,26 @@ impl Hooks for Mod {
         }
         if sm::players_due() {
             publish_players(&*host);
+        }
+    }
+
+    /// The changed chunks of a level are drawn as it ticks, with the level in place: a loaded one from a snapshot of
+    /// its sections and heights (`chunk_sections`, `chunk.heightmap`, and its eight neighbours), at once; an unloaded
+    /// one from the region files, once its save is newer than its change (`level.saved_chunk_modified`).
+    fn level_tick_pre(&self, host: HostSide, event: &mut LevelTickPreEvent) {
+        let HostSide::Server(host) = host else { return };
+        if !sm::running() {
+            return;
+        }
+        let level = event.level;
+        let dimension = level.dimension_id().to_string();
+        let Some(w) = sm::open_world_index(&dimension) else { return };
+        if !sm::world_enabled(w) {
+            return;
+        }
+        let mut cache = ChunkCache::default();
+        for (cx, cz) in sm::due_chunks(w) {
+            draw_due_chunk(host, level, w, cx, cz, &mut cache);
         }
     }
 

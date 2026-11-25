@@ -34,6 +34,9 @@ static RUNTIME: Mutex<Option<Runtime>> = Mutex::new(None);
 static EARLY: Mutex<Vec<(usize, i32, i32)>> = Mutex::new(Vec::new());
 /// Chunks loaded now, per level: a render job draws these from memory.
 static LOADED: Mutex<Option<HashSet<(usize, i32, i32)>>> = Mutex::new(None);
+/// When each changed chunk first changed since it was last drawn, in unix seconds: an unloaded chunk is drawn from
+/// the region files only once its save is at least this new (`LevelRef::saved_chunk_modified`).
+static CHANGED: Mutex<Option<HashMap<(usize, i32, i32), i64>>> = Mutex::new(None);
 /// Loaded chunks a render job handed over, drawn with the next batch.
 static HANDOFF: Mutex<Vec<(usize, i32, i32)>> = Mutex::new(Vec::new());
 /// Every level the map has seen, in the order it first saw them. An index is kept for the life of the process
@@ -247,6 +250,16 @@ pub fn level_shape(world: usize, min_y: i32, top_y: i32, ceiling: bool) {
     }
 }
 
+/// The tables a snapshot of a loaded chunk is decoded with, and the biome zoom and swamp noise it is drawn with.
+pub fn snapshot_tables() -> Option<(Arc<Ids>, Arc<WorldEnv>)> {
+    with(|rt| (rt.ids.clone(), rt.env.clone()))
+}
+
+/// The height range and ceiling of level `world`.
+pub fn level_shape_of(world: usize) -> Shape {
+    shape(world)
+}
+
 fn shape(world: usize) -> Shape {
     match LEVELS.lock().unwrap().get(world) {
         Some(l) => l.shape.unwrap_or_else(|| Shape::vanilla(&l.id)),
@@ -409,6 +422,15 @@ pub fn is_loaded(world: usize, cx: i32, cz: i32) -> bool {
 
 /// A block of level `world` changed.
 pub fn block_changed(world: usize, x: i32, z: i32) {
+    {
+        let mut changed = CHANGED.lock().unwrap();
+        let map = changed.get_or_insert_with(HashMap::new);
+        if map.len() >= 200_000 {
+            map.clear();
+        }
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+        map.entry((world, x >> 4, z >> 4)).or_insert(now);
+    }
     with(|rt| {
         if let Some(w) = rt.worlds.get_mut(world).filter(|w| w.config.map.enabled) {
             w.dirty.insert((x >> 4, z >> 4));
@@ -459,6 +481,27 @@ pub fn due_chunks(world: usize) -> Vec<(i32, i32)> {
         w.ready.drain(..n).collect()
     })
     .unwrap_or_default()
+}
+
+/// The second a chunk first changed since it was last drawn (0 when unknown).
+pub fn changed_second(world: usize, cx: i32, cz: i32) -> i64 {
+    CHANGED.lock().unwrap().as_ref().and_then(|m| m.get(&(world, cx, cz)).copied()).unwrap_or(0)
+}
+
+/// The chunk was drawn: its change is no longer pending.
+pub fn drawn(world: usize, cx: i32, cz: i32) {
+    if let Some(m) = CHANGED.lock().unwrap().as_mut() {
+        m.remove(&(world, cx, cz));
+    }
+}
+
+/// A due chunk whose save is older than its change is tried again at the next interval.
+pub fn redirty(world: usize, cx: i32, cz: i32) {
+    with(|rt| {
+        if let Some(w) = rt.worlds.get_mut(world) {
+            w.dirty.insert((cx, cz));
+        }
+    });
 }
 
 /// A due chunk. One that is still loaded has its new blocks in memory only: it waits for the next world save and is
