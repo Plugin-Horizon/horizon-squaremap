@@ -4,8 +4,7 @@
 //! missing on arismoko and what each fallback loses.
 //!
 //! The map starts in `server_started` only once the block-state and biome tables can be read
-//! (`render_tables`, TODO(arismoko-api: block_state_table)). Until then the commands answer, the
-//! config is read and the web server does not start.
+//! (`render_tables`). Until then the commands answer, the config is read and the web server does not start.
 //!
 //! Config: `config/squaremap-server.toml` (registered as a Server config; a world's
 //! `serverconfig/squaremap-server.toml` wins). The web server binds 127.0.0.1 by default.
@@ -56,6 +55,26 @@ const DATA: &str = "plugins/squaremap";
 /// `config.yml`, then `advanced.yml`, laid over the TOML config (`sm::set_yaml_layers`).
 fn read_yaml_layers() -> Vec<String> {
     ["config.yml", "advanced.yml"].iter().filter_map(|f| std::fs::read_to_string(Path::new(DATA).join(f)).ok()).collect()
+}
+
+/// Writes a setting back (`progresslogging toggle|rate`): into the TOML config, and into `config.yml` where it has the
+/// key (it is laid over the TOML one). Text edits, so comments stay. A world's `serverconfig/` copy is kept in step.
+fn persist_setting(path: &[&str], value: &str) {
+    let toml_files = [PathBuf::from("config/squaremap-server.toml"), level_dir().join("serverconfig/squaremap-server.toml")];
+    let (key, section) = (path[path.len() - 1], path[..path.len() - 1].join("."));
+    for file in toml_files {
+        if let Ok(text) = std::fs::read_to_string(&file) {
+            if let Some(new) = sm::persist::set_toml(&text, &section, key, value) {
+                let _ = std::fs::write(&file, new);
+            }
+        }
+    }
+    let yaml = Path::new(DATA).join("config.yml");
+    if let Ok(text) = std::fs::read_to_string(&yaml) {
+        if let Some(new) = sm::persist::set_yaml(&text, path, value) {
+            let _ = std::fs::write(&yaml, new);
+        }
+    }
 }
 
 /// The language file `settings.language-file` names, from `locale/` (its file name only); none leaves the English text.
@@ -127,9 +146,7 @@ fn resources_dir() -> Option<PathBuf> {
 /// worldgen files (`sm::vanilla`); the host answers each block's states and their map colours.
 /// Cause of "not started" before this: the function returned None unconditionally, so `server_started`
 /// never reached `sm::start` (no hook, level-name or capability problem).
-// TODO(arismoko-api: biome_zoom): the biome zoom (`quart_at_block`) and the swamp grass noise the
-//   core uses for chunks it reads from the region files: `WorldEnv::plain()` (unfuzzed quart cell,
-//   flat swamp grass) stands in.
+/// The world env (biome zoom and swamp grass noise) is computed from the overworld's seed (`sm::noise`).
 fn render_tables(host: &dyn ServerHost) -> Option<(Vec<sm::RawState>, Vec<sm::RawBiome>, sm::WorldEnv)> {
     let dir = resources_dir()?;
     let mut states = Vec::new();
@@ -181,7 +198,28 @@ fn render_tables(host: &dyn ServerHost) -> Option<(Vec<sm::RawState>, Vec<sm::Ra
     if states.is_empty() || biomes.is_empty() {
         return None;
     }
-    Some((states, biomes, sm::WorldEnv::plain()))
+    Some((states, biomes, world_env(host)))
+}
+
+/// `BiomeManager`'s zoom and the swamp grass noise for chunks read from the region files. The zoom is seeded by
+/// the world seed (one for every level); without a loaded overworld the plain quart cell stands in.
+fn world_env(host: &dyn ServerHost) -> sm::WorldEnv {
+    let seed = host.level("minecraft:overworld").and_then(|l| l.seed(host));
+    let swamp = sm::noise::SwampNoise::new();
+    match seed {
+        Some(seed) => {
+            let biome_seed = sm::noise::obfuscate_seed(seed);
+            sm::WorldEnv {
+                zoom: Box::new(move |x, y, z| sm::noise::quart_at_block(biome_seed, x, y, z)),
+                swamp_grass: Box::new(move |_, x, z| swamp.grass(x, z)),
+            }
+        }
+        None => {
+            let mut env = sm::WorldEnv::plain();
+            env.swamp_grass = Box::new(move |_, x, z| swamp.grass(x, z));
+            env
+        }
+    }
 }
 
 /// The border of a dimension's level and the world spawn column (`LevelData.getRespawnData`, one spawn
@@ -215,7 +253,11 @@ fn sync_levels(host: &mut dyn ServerHost, add: Option<&str>, remove: Option<&str
     sm::set_open_levels(&ids);
     for id in &ids {
         let (Some(w), Some(level)) = (sm::world_index(id), host.level(id)) else { continue };
-        if let Some((min_y, height)) = level.height(&*host) {
+        // The dimension type (`LevelRef.dimension_type`) gives the ceiling flag and the build height of a custom
+        // level; the plain height range and the nether's id stand in when the host has none.
+        if let Some(ty) = level.dimension_type(&*host) {
+            sm::level_shape(w, ty.min_y, ty.min_y + ty.height, ty.has_ceiling);
+        } else if let Some((min_y, height)) = level.height(&*host) {
             sm::level_shape(w, min_y, min_y + height, id.as_str() == "minecraft:the_nether");
         }
     }
@@ -277,8 +319,8 @@ fn publish_players(host: &dyn ServerHost) {
             health: living.health(host).unwrap_or(0.0),
             // `Attributes.ARMOR` with every modifier, as the game answers it.
             armor: living.attribute_value(host, "minecraft:armor").map(|v| v.floor() as i32),
-            // HMOD-GAP(nickname): Horizon main can set a nickname but has no getter, so the map shows the real name.
-            display_name: None,
+            // `use-display-names`: the nickname `player_set_nickname` shows in place of the name, if any.
+            display_name: p.nickname(host).flatten(),
         });
     }
     sm::publish_players(&list, max_players(host));
@@ -317,7 +359,7 @@ fn prefix() -> Vec<Text> {
 /// One piece of text with squaremap's colour, click and hover.
 fn styled(text: &str, color: Option<u32>, click: Option<TextClick>, hover: Option<&str>) -> Text {
     let mut style = TextStyle::default();
-    // TODO(arismoko-api: text_colour_format): colours are sent as `#RRGGBB`; check Horizon accepts that form.
+    // `TextStyle.color` takes `#RRGGBB`.
     style.color = color.map(|c| format!("#{c:06X}"));
     style.click = click;
     style.hover = hover.map(|h| TextHover::Text(Box::new(Text::literal(h))));
@@ -332,7 +374,7 @@ fn line_text(line: &sm::commands::Line) -> Text {
             text = text.append(piece);
         }
     }
-    for part in &line.parts {
+    for part in &line.expanded() {
         let click = part.click.as_ref().map(|c| match c {
             sm::commands::Click::Run(command) => TextClick::RunCommand(command.clone()),
             sm::commands::Click::Open(url) => TextClick::OpenUrl(url.clone()),
@@ -365,6 +407,7 @@ impl Hooks for Mod {
     }
 
     fn server_started(&self, host: &mut dyn ServerHost, _: &mut ServerStartedEvent) {
+        sm::set_persist(persist_setting);
         sync_levels(host, None, None);
         match render_tables(&*host) {
             Some((states, biomes, env)) => match sm::start(&level_dir(), states, biomes, env) {
@@ -391,7 +434,7 @@ impl Hooks for Mod {
             if !sm::world_enabled(w) {
                 continue;
             }
-            // TODO(arismoko-api: chunk_snapshot): loaded chunks are not snapshotted. A changed chunk that is still
+            // HMOD-GAP(chunk_snapshot): loaded chunks are not snapshotted. A changed chunk that is still
             // loaded is drawn from the region files once the next world save has written it (`world_saved`); one
             // that was unloaded meanwhile is drawn from them at once.
             for (cx, cz) in sm::due_chunks(w) {
@@ -546,7 +589,6 @@ impl Hooks for Mod {
     }
 
     fn tab_complete(&self, _: &mut dyn ServerHost, e: &mut TabCompleteEvent<'_>) {
-        // TODO(arismoko-api: verify): event field names `command`, `range`, `suggestions` are assumed.
         for text in sm::commands::world_completions(e.command) {
             if !e.suggestions.iter().any(|s| s.text == text) {
                 e.suggestions.push(Suggestion::new((e.range[0], e.range[1]), text));

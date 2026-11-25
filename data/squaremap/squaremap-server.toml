@@ -35,7 +35,7 @@ enabled = false
 value = 0.0
 
 # Progress lines of full and radius renders on the console. Changed at runtime with
-# `/squaremap progresslogging toggle|rate <seconds>` (not written back to this file).
+# `/squaremap progresslogging toggle|rate <seconds>` (written back to this file when it changes).
 [settings.render-progress-logging]
 enabled = true
 interval-seconds = 1

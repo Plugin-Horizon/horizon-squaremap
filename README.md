@@ -80,23 +80,18 @@ The web folder defaults to `squaremap/web` inside the world folder.
 
 ## Not ported
 
-- The update checker (English messages are built in, with squaremap's colours, hovers and clicks; a language
-  file replaces the wording, see the Known gaps section).
-- `progresslogging toggle|rate` change the running server only; squaremap writes them
-  back to its config.
-- Region files are read for chunks compressed with gzip, zlib or not at all (vanilla's
-  default is zlib); LZ4 and custom compression are skipped, as are pre-1.18 chunks that
-  need below-zero retrogen (squaremap has the server upgrade those).
+- The update checker (`settings.update-checker` is read, but it compared the Java jar's manifest with Modrinth
+  releases; this mod has no such jar, so nothing is checked).
+- Region files compressed with a custom algorithm (127) are skipped, as are pre-1.18 chunks that
+  need below-zero retrogen (squaremap has the server upgrade those). gzip, zlib, LZ4 and stored chunks are read.
 - The API is Rust functions for mods built into the same server; there is no Java API.
   Its layers use fixed labels (no per-viewer supplier).
 - Armour points are the player's `minecraft:armor` attribute (`native_attribute`, equipment
   modifiers included) where the player has a body; otherwise vanilla's armour materials by
   the worn items' names (`native_player_equipment`).
-- Swamp grass of live chunks is sampled per column of the 3x3 snapshot from
-  `native_biome_tint` (a blend reaching further reads the nearest column); chunks drawn from
-  region files still use the game's grass noise directly, as the helpers can't be called
-  off the server thread. Biome climate and grass modifiers come from the world's biome table
-  (the tint doesn't carry them).
+- Chunks read from region files get the game's biome zoom (`BiomeManager`, seeded by the SHA-256 of the world seed)
+  and the swamp grass noise (`BIOME_INFO_NOISE`) computed in `noise.rs`. Biome climate and grass modifiers come from
+  the world's biome table.
 - Biomes in chunks outside the 3x3 snapshot (a blend reaching into an unloaded chunk) are
   read from the region files; a chunk never generated reads the nearest cell of the
   rendered chunk, where squaremap asks the biome source.
@@ -115,16 +110,25 @@ horizon-launcher native-build <path to this folder> --server-output <dir> --vers
 
 ## Known gaps
 
-What does not work yet on arismoko/horizon (each is marked `TODO(arismoko-api: ...)` or `HMOD-GAP(...)` in `src/lib.rs`):
+What does not work yet (one gap needs an engine API; see `audit/rec100/ENGINE_NEEDS.md`):
 
-- The web renderer starts (the block-state and biome tables are built from the resource folder and the host); with the tables missing the commands still answer and the config is read, but no tiles are drawn.
-- Loaded chunks are not snapshotted (no chunk snapshot API): a changed chunk that is still loaded is redrawn from the region files after the next world save (one that unloaded, at once), so the live map follows the save, not the block change.
-- Levels follow the host's list (`list_levels`) as they load and unload (`level_load`, `level_unload`); a level keeps its index and queued work while it is closed. A level's height range comes from `LevelRef.height`, but its ceiling is vanilla's (only the nether has one): the host gives no dimension-type ceiling.
-- Display names are the real names (no nickname getter on Horizon).
-- The `map-invisibility-equipment` hide rule reads `minecraft:map_invisibility_equipment` through the host's registry tag query (`registry_entry_in_tag`); a datapack that edits the tag is followed only where the host answers, and the vanilla entry (carved pumpkin) answers when it does not.
-- Configuration is `config/squaremap-server.toml` (TOML); `plugins/squaremap/config.yml` and `advanced.yml` are read over it when present, and `locale/lang-*.yml` (`settings.language-file`) replaces the command messages (wording and placeholders; MiniMessage colours and click tags are not followed). The full and radius render settings (workers, limits) are not read.
-- `/squaremap help` follows cloud's paged help from memory (title bar and page arrows may differ in detail); `hide`/`show <player>` use Horizon's player argument, so selector errors are the engine's own wording.
-- Region files compressed with LZ4 are skipped; the swamp grass noise of chunks read from disk is approximated.
+- Loaded chunks are not snapshotted (the live chunk read of `chunk_sections` is only on the `rec-world-data` branch and gives no heightmaps): a changed chunk that is still loaded is redrawn from the region files after the next world save (one that unloaded, at once), so the live map follows the save, not the block change.
+- `/squaremap help` follows cloud-minecraft-extras' paged help from memory (title bar and page arrows may differ in detail); that library is not part of squaremap's source.
+- `settings.update-checker` is read and does nothing (see Not ported).
+
+Closed in round 2: nicknames on the map (`player_nickname`), the dimension type's ceiling and build height for custom
+levels (`level_dimension_type`), the `full`/`radius`/`background` render limits and `image-saving.*` (see below),
+`progresslogging` written back to the config, LZ4 region files, the biome zoom and swamp grass noise of saved chunks,
+and the language file's MiniMessage colour, click and hover tags.
+
+Render limits (`map.render.full|radius|background.*`, `map.image-saving.*`, legacy `map.max-render-threads`):
+`workers` draw a batch of up to `max-active-chunks` saved chunks on that many threads, each with a cache of
+`idle-chunk-cache-size` chunks; `image-saving.max-pending-images` bounds the images waiting to be written.
+`max-chunk-requests`, `max-active-regions`, `max-column-chunks`, `image-saving.workers` and `render.background.workers`
+are read and validated like squaremap's, but have no counterpart in this reader (it has no asynchronous chunk requests
+and one writer thread); the background renderer is paced by `interval-seconds` and `max-chunks-per-interval`.
+
+Configuration is `config/squaremap-server.toml` (TOML); `plugins/squaremap/config.yml` and `advanced.yml` are read over it when present, and `locale/lang-*.yml` (`settings.language-file`) replaces the command messages (wording, placeholders and MiniMessage colours, clicks and hovers).
 
 ## Licence
 

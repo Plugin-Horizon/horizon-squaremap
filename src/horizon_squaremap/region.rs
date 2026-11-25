@@ -147,16 +147,112 @@ impl RegionFile {
     }
 }
 
-/// `RegionFileVersion`: 1 gzip, 2 zlib, 3 none. LZ4 (4) and custom (127) are not read.
+/// `RegionFileVersion`: 1 gzip, 2 zlib, 3 none, 4 LZ4 (lz4-java's block stream). Custom (127) is not read.
 pub fn decompress(kind: u8, data: &[u8]) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
     match kind {
         1 => flate2::read::GzDecoder::new(data).read_to_end(&mut out).map_err(|e| e.to_string())?,
         2 => flate2::read::ZlibDecoder::new(data).read_to_end(&mut out).map_err(|e| e.to_string())?,
         3 => return Ok(data.to_vec()),
+        4 => return lz4_block_stream(data),
         k => return Err(format!("chunk compression {k} is not supported")),
     };
     Ok(out)
+}
+
+/// lz4-java's `LZ4BlockOutputStream` format (what `RegionFileVersion.VERSION_LZ4` writes): blocks of
+/// `LZ4Block`, a token (0x10 stored, 0x20 compressed; the low nibble is the level), the compressed and the original
+/// length and a checksum (all little endian), then the data; a block of length 0 ends the stream.
+pub fn lz4_block_stream(data: &[u8]) -> Result<Vec<u8>, String> {
+    const MAGIC: &[u8; 8] = b"LZ4Block";
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    while at < data.len() {
+        let head = data.get(at..at + 21).ok_or("truncated LZ4 block header")?;
+        if &head[..8] != MAGIC {
+            return Err("bad LZ4 block magic".into());
+        }
+        let method = head[8] & 0xF0;
+        let compressed = u32::from_le_bytes(head[9..13].try_into().unwrap()) as usize;
+        let original = u32::from_le_bytes(head[13..17].try_into().unwrap()) as usize;
+        at += 21;
+        if original == 0 {
+            break;
+        }
+        if original > 1 << 26 {
+            return Err("LZ4 block too large".into());
+        }
+        let body = data.get(at..at + compressed).ok_or("truncated LZ4 block")?;
+        at += compressed;
+        match method {
+            0x10 => {
+                if compressed != original {
+                    return Err("bad stored LZ4 block".into());
+                }
+                out.extend_from_slice(body);
+            }
+            0x20 => lz4_block(body, original, &mut out)?,
+            m => return Err(format!("unknown LZ4 block method {m:#x}")),
+        }
+    }
+    Ok(out)
+}
+
+/// One LZ4 block (`LZ4_decompress_safe`): `original` bytes are appended to `out`.
+fn lz4_block(src: &[u8], original: usize, out: &mut Vec<u8>) -> Result<(), String> {
+    let start = out.len();
+    let end = start + original;
+    let mut i = 0usize;
+    let byte = |i: usize| src.get(i).copied().ok_or_else(|| "truncated LZ4 data".to_string());
+    while i < src.len() {
+        let token = src[i];
+        i += 1;
+        let mut literals = (token >> 4) as usize;
+        if literals == 15 {
+            loop {
+                let b = byte(i)?;
+                i += 1;
+                literals += b as usize;
+                if b != 255 {
+                    break;
+                }
+            }
+        }
+        let lit = src.get(i..i + literals).ok_or("truncated LZ4 literals")?;
+        out.extend_from_slice(lit);
+        i += literals;
+        if out.len() >= end {
+            break; // the last sequence has no match
+        }
+        let offset = u16::from_le_bytes([byte(i)?, byte(i + 1)?]) as usize;
+        i += 2;
+        let mut len = (token & 15) as usize;
+        if len == 15 {
+            loop {
+                let b = byte(i)?;
+                i += 1;
+                len += b as usize;
+                if b != 255 {
+                    break;
+                }
+            }
+        }
+        len += 4;
+        if offset == 0 || offset > out.len() - start {
+            return Err("bad LZ4 match offset".into());
+        }
+        for _ in 0..len {
+            let b = out[out.len() - offset];
+            out.push(b);
+        }
+        if out.len() > end {
+            return Err("LZ4 block overruns its length".into());
+        }
+    }
+    if out.len() != end {
+        return Err("LZ4 block has the wrong length".into());
+    }
+    Ok(())
 }
 
 /// Block state ids by `name[key=value,...]` (keys sorted), and biome ids by name, from
@@ -394,20 +490,33 @@ pub struct DiskCache {
     chunks: HashMap<(i32, i32), (Option<Arc<DiskChunk>>, u64)>,
     files: HashMap<(i32, i32), (Option<RegionFile>, u64)>,
     clock: u64,
+    cap: usize,
     /// Chunks that failed to read, with the reason (logged by the caller).
     pub errors: Vec<((i32, i32), String)>,
 }
 
+/// Decoded chunks a cache keeps (`idle-chunk-cache-size` of a render sets it).
 const CACHED_CHUNKS: usize = 384;
 const CACHED_FILES: usize = 9;
 
 impl DiskCache {
     pub fn new(dir: PathBuf, ids: Arc<Ids>, shape: Shape) -> DiskCache {
-        DiskCache { dir, ids, shape, chunks: HashMap::new(), files: HashMap::new(), clock: 0, errors: Vec::new() }
+        DiskCache { dir, ids, shape, chunks: HashMap::new(), files: HashMap::new(), clock: 0, cap: CACHED_CHUNKS, errors: Vec::new() }
     }
 
     pub fn shape(&self) -> Shape {
         self.shape
+    }
+
+    /// How many decoded chunks the cache keeps (at least a chunk and its eight neighbours).
+    pub fn with_capacity(mut self, chunks: usize) -> DiskCache {
+        self.cap = chunks.max(9);
+        self
+    }
+
+    /// An empty cache on the same folder, for another worker thread.
+    pub fn fork(&self) -> DiskCache {
+        DiskCache::new(self.dir.clone(), self.ids.clone(), self.shape).with_capacity(self.cap)
     }
 
     /// Closes the region files, so their location tables are read again (the server may
@@ -461,7 +570,7 @@ impl DiskCache {
                 None
             }
         };
-        if self.chunks.len() >= CACHED_CHUNKS {
+        if self.chunks.len() >= self.cap {
             if let Some(old) = self.chunks.iter().min_by_key(|(_, (_, t))| *t).map(|(k, _)| *k) {
                 self.chunks.remove(&old);
             }
@@ -540,6 +649,50 @@ impl ChunkView for DiskView {
 }
 
 /// Writers for tests: a chunk's NBT and a region file holding chunks.
+#[cfg(test)]
+mod lz4_tests {
+    use super::*;
+
+    fn block(method: u8, compressed: &[u8], original: usize) -> Vec<u8> {
+        let mut b = b"LZ4Block".to_vec();
+        b.push(method);
+        b.extend((compressed.len() as u32).to_le_bytes());
+        b.extend((original as u32).to_le_bytes());
+        b.extend(0u32.to_le_bytes()); // checksum, not checked
+        b.extend(compressed);
+        b
+    }
+
+    fn end() -> Vec<u8> {
+        block(0x10, &[], 0)
+    }
+
+    #[test]
+    fn lz4_stream_reads_stored_and_compressed_blocks() {
+        // "abcabcabcabcXY": literals "abc", a match (offset 3, 9 more bytes), then literals "XY".
+        let sequence1 = [0x35u8, b'a', b'b', b'c', 3, 0]; // 3 literals, match length 5 + 4 = 9
+        let sequence2 = [0x20u8, b'X', b'Y']; // last: 2 literals
+        let mut compressed = sequence1.to_vec();
+        compressed.extend(sequence2);
+        let mut stream = block(0x20, &compressed, 14);
+        stream.extend(block(0x10, b"!!", 2));
+        stream.extend(end());
+        assert_eq!(lz4_block_stream(&stream).unwrap(), b"abcabcabcabcXY!!");
+        assert_eq!(decompress(4, &stream).unwrap(), b"abcabcabcabcXY!!");
+    }
+
+    #[test]
+    fn lz4_long_runs_use_length_extension_bytes() {
+        // 20 literals: token 0xF0, extension 5; then end.
+        let mut compressed = vec![0xF0, 5];
+        compressed.extend(std::iter::repeat(7u8).take(20));
+        let mut stream = block(0x20, &compressed, 20);
+        stream.extend(end());
+        assert_eq!(lz4_block_stream(&stream).unwrap(), vec![7u8; 20]);
+        assert!(lz4_block_stream(b"LZ4Blocx").is_err());
+    }
+}
+
 #[cfg(test)]
 pub mod testdata {
     use crate::horizon_squaremap::nbt::write::{compound, root};

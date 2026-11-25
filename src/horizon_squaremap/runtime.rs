@@ -743,8 +743,24 @@ pub fn render_status(world: usize) -> Option<(Mode, usize, usize, bool)> {
     .flatten()
 }
 
-/// `progresslogging toggle|rate`: the running jobs log their next line now.
+/// Writes one setting back to the config files (`settings.render-progress-logging.enabled`, ...): the glue sets it.
+static PERSIST: Mutex<Option<fn(&[&str], &str)>> = Mutex::new(None);
+
+/// Registers the function that writes a setting (key path, value text) into the server's config files.
+pub fn set_persist(f: fn(&[&str], &str)) {
+    *PERSIST.lock().unwrap() = Some(f);
+}
+
+/// Saves `settings.render-progress-logging` as `progresslogging toggle|rate` changed it.
+fn persist_progress_logging() {
+    let Some(f) = *PERSIST.lock().unwrap() else { return };
+    f(&["settings", "render-progress-logging", "enabled"], &render::PROGRESS_LOGGING.load(Ordering::Relaxed).to_string());
+    f(&["settings", "render-progress-logging", "interval-seconds"], &render::PROGRESS_INTERVAL.load(Ordering::Relaxed).to_string());
+}
+
+/// `progresslogging toggle|rate`: the setting is saved and the running jobs log their next line now.
 pub fn restart_progress_logging() {
+    persist_progress_logging();
     with(|rt| {
         for j in rt.worlds.iter().filter_map(|w| w.job.as_ref()) {
             j.control.log_now.store(true, Ordering::Relaxed);
@@ -902,7 +918,11 @@ impl Runtime {
     fn spawn_job(&mut self, world: usize, mode: Mode, plan: Box<dyn FnOnce(()) -> Plan + Send>) {
         let checkpoint = self.checkpoint(world);
         let id = self.worlds[world].id.clone();
-        let cache = DiskCache::new(region_dir(&self.dir, &id), self.ids.clone(), shape(world));
+        let w = &self.worlds[world];
+        let limits = if mode == Mode::Full { w.config.map.full_limits() } else { w.config.map.radius_limits() };
+        let max_unsaved = w.config.map.image_saving.resolve().1;
+        let cache = DiskCache::new(region_dir(&self.dir, &id), self.ids.clone(), shape(world))
+            .with_capacity(limits.idle_chunk_cache_size);
         let (env, sender) = (self.env.clone(), self.jobs.clone());
         let w = &mut self.worlds[world];
         if let Some(t) = w.job.take().and_then(|mut j| j.thread.take()) {
@@ -933,6 +953,8 @@ impl Runtime {
                     }
                 }),
                 control: c.clone(),
+                limits,
+                max_unsaved,
             };
             let complete = render::run(job);
             if complete {

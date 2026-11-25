@@ -163,7 +163,12 @@ pub struct Line {
 impl Line {
     /// The text without colours, hovers and clicks.
     pub fn text(&self) -> String {
-        self.parts.iter().map(|p| p.text.as_str()).collect()
+        self.expanded().iter().map(|p| p.text.as_str()).collect()
+    }
+
+    /// The parts with the language file's MiniMessage tags turned into colours, clicks and hovers.
+    pub fn expanded(&self) -> Vec<Part> {
+        self.parts.iter().flat_map(crate::horizon_squaremap::mini::expand).collect()
     }
 }
 
@@ -185,8 +190,8 @@ fn clickable(mut p: Part, hover: impl Into<String>, click: Click) -> Part {
 static LANG: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
 
 /// Reads a language file (squaremap's `locale/lang-en.yml` form). Keys it lacks keep the English text. A message
-/// is MiniMessage there; its colour and click tags are not followed, only its words and placeholders (the colours of
-/// each message stay squaremap's defaults). A file that cannot be read leaves the previous language.
+/// is MiniMessage there: its colour, click and hover tags are followed (`mini`), the message keeping squaremap's colour
+/// where the file sets none. A file that cannot be read leaves the previous language.
 pub fn set_language(text: &str) -> Result<(), String> {
     let table = crate::horizon_squaremap::yaml::parse(text)?;
     *LANG.lock().unwrap() = Some(crate::horizon_squaremap::yaml::flatten(&table));
@@ -198,14 +203,17 @@ pub fn clear_language() {
     *LANG.lock().unwrap() = None;
 }
 
-/// A message by its key in the language file: the file's text, else `default`, with `<name>` placeholders from
-/// `vars` filled in and every other MiniMessage tag dropped.
+/// A message by its key in the language file: the file's text (behind `mini::MARK`, its tags still in it, for
+/// `Line::expanded`), else `default`, with `<name>` placeholders from `vars` filled in and every other tag dropped.
 fn tr(key: &str, default: &str, vars: &[(&str, &str)]) -> String {
     tr_from(LANG.lock().unwrap().as_ref(), key, default, vars)
 }
 
 fn tr_from(lang: Option<&HashMap<String, String>>, key: &str, default: &str, vars: &[(&str, &str)]) -> String {
-    fill(lang.and_then(|m| m.get(key)).map_or(default, String::as_str), vars)
+    match lang.and_then(|m| m.get(key)) {
+        Some(text) => format!("{}{}", crate::horizon_squaremap::mini::MARK, crate::horizon_squaremap::mini::fill_rich(text, vars)),
+        None => fill(default, vars),
+    }
 }
 
 fn fill(template: &str, vars: &[(&str, &str)]) -> String {
@@ -1070,8 +1078,14 @@ mod tests {
         assert_eq!(fill("a < b", &[]), "a < b");
         let file = "render-not-in-progress: '<red>Kein Render fuer <world>'\ncommand:\n  message:\n    no-pending-commands: Nichts ausstehend\n";
         let lang = crate::horizon_squaremap::yaml::flatten(&crate::horizon_squaremap::yaml::parse(file).unwrap());
-        assert_eq!(tr_from(Some(&lang), "render-not-in-progress", "No renders running for <world>", &[("world", "x")]), "Kein Render fuer x");
-        assert_eq!(tr_from(Some(&lang), "command.message.no-pending-commands", "You don't have any pending commands.", &[]), "Nichts ausstehend");
+        assert_eq!(tr_from(Some(&lang), "render-not-in-progress", "No renders running for <world>", &[("world", "x")]), "\u{1}<red>Kein Render fuer x");
+        assert_eq!(tr_from(Some(&lang), "command.message.no-pending-commands", "You don't have any pending commands.", &[]), "\u{1}Nichts ausstehend");
+        // The line the player gets: the file's colour wins over the command's default, the tags are gone.
+        let line = msg(tr_from(Some(&lang), "render-not-in-progress", "No renders running for <world>", &[("world", "a<b")]), GREEN);
+        assert_eq!(line.text(), "Kein Render fuer a<b");
+        assert_eq!(line.expanded()[0].color, Some(RED));
+        let plain_line = msg(tr_from(Some(&lang), "command.message.no-pending-commands", "x", &[]), GREEN);
+        assert_eq!(plain_line.expanded()[0].color, Some(GREEN));
         // A key the file lacks keeps the English text.
         assert_eq!(tr_from(Some(&lang), "cancelled-render", "Render cancelled for <world>", &[("world", "x")]), "Render cancelled for x");
         assert_eq!(tr_from(None, "cancelled-render", "Render cancelled for <world>", &[("world", "y")]), "Render cancelled for y");

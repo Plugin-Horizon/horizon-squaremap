@@ -38,14 +38,12 @@ Round 1
   - `src/lib.rs` `NODES` + `node(name)` helper: typed Boolean nodes for every node the map checks.
   - `src/lib.rs` `permission_gather_nodes` (new hook): declares the 13 nodes at Level 2 (`commands::OP_LEVEL`).
   - `src/lib.rs` `register_commands` / `player_command` / `run_mod_command`: `permission_node(...)` (still a string in the core) is converted to a typed node at the call site; `has_permission` replaced by `permission_bool(...).unwrap_or(false)`, for the subcommand node and both `.others` nodes.
-  - `src/lib.rs` `publish_players`: `nickname` has no Horizon main counterpart; `display_name: None` with a `HMOD-GAP` comment.
+  - `src/lib.rs` `publish_players`: `display_name` is the nickname (`player_nickname`), round 2.
   - Imports added for the permission types.
   - `src/horizon_squaremap/commands.rs` is unchanged: its string-returning helpers and their tests stay as they were.
 - Permission nodes: `squaremap.command.{help,cancelrender,fullrender,pauserender,radiusrender,resetmap,progresslogging,hide,show,reload,link}` and `squaremap.command.hide.others`, `squaremap.command.show.others` -> Level 1 (any operator, as Bukkit's default for an unregistered node; Level 2 in round 1), declared in `src/lib.rs` `permission_gather_nodes` from `NODES`.
 - Gaps:
-  - HMOD-GAP(nickname): Horizon main has `set_nickname` but no getter. The map's `display_name` is always the real name.
-  - HMOD-GAP(chunk_snapshot): no chunk snapshot API; changed loaded chunks are not redrawn in the background.
-  - HMOD-GAP(item_in_tag): no item tag query; the `map-invisibility-equipment` rule uses the vanilla tag's entry (carved pumpkin).
+  - HMOD-GAP(chunk_snapshot): no chunk snapshot API in the combined SDK (`chunk_sections` is only on `rec-world-data`, without heightmaps); changed loaded chunks are redrawn after the next save.
 - Unsure:
   - `NODES` is a fixed list, not derived from `commands::usages()`, because `usages()` reads the runtime config (not loaded at gather time). If the label or the command set changes, `NODES` must follow.
   - The `.others` nodes had no declared default before. I chose Level 2 to match the subcommand nodes.
