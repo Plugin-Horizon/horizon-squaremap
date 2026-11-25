@@ -307,6 +307,7 @@ fn start_with(args: StartArgs) -> Result<(), String> {
     let data = world_dir.join("squaremap").join("data");
     crate::horizon_squaremap::api::load_hidden(data.join("hidden-players.json"));
     let now = Instant::now();
+    let flush_json_immediately = config.settings.internal_webserver.flush_json_immediately;
     let mut rt = Runtime {
         web,
         dir: world_dir,
@@ -320,7 +321,7 @@ fn start_with(args: StartArgs) -> Result<(), String> {
         in_flight,
         json,
         server,
-        flush_json_immediately: config.settings.internal_webserver.flush_json_immediately,
+        flush_json_immediately,
         next_players: now,
         players: String::new(),
     };
