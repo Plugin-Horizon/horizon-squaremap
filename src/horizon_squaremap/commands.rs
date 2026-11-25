@@ -290,6 +290,18 @@ fn highlight_special(text: &str, color: u32) -> Vec<Part> {
 /// The subcommands of the bare label, as cloud lists them when the label alone is typed.
 const ROOT_SYNTAX: &str = "<cancelrender|confirm|fullrender|help|hide|link|pauserender|progresslogging|radiusrender|reload|resetmap|show>";
 
+/// The permission node that shows the failure's detail (ExceptionHandler.commandExecution).
+pub const STACKTRACE_NODE: &str = "squaremap.command-exception-stacktrace";
+
+/// squaremap's `command.message.exception.command-execution`: an unexpected failure while a command ran. `detail` is
+/// put on hover for senders holding `squaremap.command-exception-stacktrace`.
+pub fn command_failed(detail: Option<&str>) -> Line {
+    let text = tr("command.message.exception.command-execution", "An internal error occurred while attempting to perform this command.", &[]);
+    let mut p = colored(text, RED);
+    p.hover = detail.map(str::to_string);
+    error(vec![p])
+}
+
 /// squaremap's `command.message.exception.no-permission`, as the player sees it.
 pub fn no_permission() -> Line {
     error(vec![colored(
@@ -935,6 +947,16 @@ pub fn status_lines() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn command_failed_hover_only_with_detail() {
+        let plain = command_failed(None);
+        assert!(plain.parts[0].hover.is_none());
+        assert!(plain.prefixed);
+        let with = command_failed(Some("boom"));
+        assert_eq!(with.parts[0].hover.as_deref(), Some("boom"));
+        assert_eq!(STACKTRACE_NODE, "squaremap.command-exception-stacktrace");
+    }
+
     use super::*;
 
     fn texts(lines: &[Line]) -> Vec<String> {

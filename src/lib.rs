@@ -34,7 +34,23 @@ static CHUNKY_SUBSCRIBED: std::sync::atomic::AtomicBool = std::sync::atomic::Ato
 const SUBSCRIBE_EVERY: u64 = 100;
 
 /// ChunkyBorder's `map-options`, read when a border is drawn (`config/chunkyborder/config.yml` or `.toml`).
-fn border_options() -> chunky_border::Options {
+fn border_options(host: &mut dyn ServerHost) -> chunky_border::Options {
+    // The chunky mod owns and validates the keys; the file is read only when it does not answer.
+    if let Some(o) = host
+        .commands()
+        .call_mod_service("chunky:api", b"map_options")
+        .ok()
+        .and_then(|r| String::from_utf8(r).ok())
+        .and_then(|r| chunky_border::Options::from_service(&r))
+    {
+        return o;
+    }
+    border_options_from_file()
+}
+
+/// The same keys read from ChunkyBorder's own file: used when the chunky mod does not answer, and from inside its
+/// event callback (calling it back from there could re-enter it).
+fn border_options_from_file() -> chunky_border::Options {
     let dir = Path::new("config/chunkyborder");
     let text = std::fs::read_to_string(dir.join("config.toml")).or_else(|_| std::fs::read_to_string(dir.join("config.yml")));
     text.map(|t| chunky_border::Options::parse(&t)).unwrap_or_default()
@@ -51,7 +67,7 @@ fn subscribe_to_chunky(host: &mut dyn ServerHost) {
         return;
     }
     CHUNKY_SUBSCRIBED.store(true, Ordering::Relaxed);
-    let options = border_options();
+    let options = border_options(host);
     for (_, dimension) in sm::open_levels() {
         let line = format!("border_get\t{}", chunky_border::world_of(&dimension));
         let Ok(reply) = host.commands().call_mod_service("chunky:api", line.as_bytes()) else { continue };
@@ -63,7 +79,7 @@ fn subscribe_to_chunky(host: &mut dyn ServerHost) {
 
 /// Every permission node the map checks: the subcommands' (`squaremap.command.<sub>`, the ones
 /// `commands::usages` lists) and the two `.others` nodes. Declared in `permission_gather_nodes`.
-const NODES: [&str; 13] = [
+const NODES: [&str; 14] = [
     "squaremap.command.help",
     "squaremap.command.cancelrender",
     "squaremap.command.fullrender",
@@ -77,6 +93,7 @@ const NODES: [&str; 13] = [
     "squaremap.command.link",
     "squaremap.command.hide.others",
     "squaremap.command.show.others",
+    sm::commands::STACKTRACE_NODE,
 ];
 
 /// A Boolean permission node named `name`, as the map's commands ask it.
@@ -543,7 +560,7 @@ impl Hooks for Mod {
         if let Some((world, border)) = chunky_border::parse_event(line)
             && let Some(dimension) = chunky_border::dimension_of(&world)
         {
-            chunky_border::apply(&dimension, border.as_ref(), &border_options());
+            chunky_border::apply(&dimension, border.as_ref(), &border_options_from_file());
         }
         Some(mod_api::PayloadBytes(b"ok".to_vec()))
     }
@@ -723,7 +740,26 @@ impl Hooks for Mod {
             }
             _ => return Flow::Continue,
         };
-        let lines = sm::commands::command(&line, &sender, &online(&*host));
+        let online_now = online(&*host);
+        let lines = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sm::commands::command(&line, &sender, &online_now))) {
+            Ok(lines) => lines,
+            Err(panic) => {
+                // ExceptionHandler.commandExecution: log it, tell the sender, detail on hover for the stacktrace node.
+                let detail = panic
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "unknown panic".into());
+                eprintln!("[squaremap] An unexpected error occurred during command execution: {detail}");
+                let may_see = match &event.source {
+                    CommandSource::Player { player, .. } => {
+                        player.permission_bool(&mut *host, &node(sm::commands::STACKTRACE_NODE)).unwrap_or(false)
+                    }
+                    _ => true,
+                };
+                vec![sm::commands::command_failed(may_see.then_some(detail.as_str()))]
+            }
+        };
         if line.split_whitespace().nth(1).is_some_and(|w| w.eq_ignore_ascii_case("reload")) {
             // `reload` also reads the language file again.
             load_language();

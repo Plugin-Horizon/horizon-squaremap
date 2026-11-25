@@ -70,6 +70,25 @@ impl Options {
     }
 }
 
+impl Options {
+    /// The chunky mod's `map_options` reply (`bluemap dynmap pl3xmap squaremap label hide-by-default color weight
+    /// priority`, tab-separated): chunky owns and validates the keys, so this is what the border is drawn with.
+    pub fn from_service(reply: &str) -> Option<Options> {
+        let f: Vec<&str> = reply.trim_end_matches(['\r', '\n']).split('\t').collect();
+        if f.len() != 9 {
+            return None;
+        }
+        Some(Options {
+            enabled: f[3] == "true",
+            label: f[4].to_owned(),
+            hide_by_default: f[5] == "true",
+            color: u32::from_str_radix(f[6], 16).ok()? & 0xFF_FFFF,
+            weight: f[7].parse().ok()?,
+            priority: f[8].parse().ok()?,
+        })
+    }
+}
+
 /// `<world> <shape> <x> <z> <rx> <rz> [<wrap>]` as tab-separated fields (the reply of `border_get`, and the tail of
 /// a `border_change` event).
 pub fn parse_border(fields: &[&str]) -> Option<Border> {
@@ -209,6 +228,16 @@ pub fn apply(dimension: &str, border: Option<&Border>, o: &Options) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_chunky_reply_and_the_file_agree() {
+        // chunky's `MapOptions::fields()` for this config text.
+        let text = "map-options:\n  enable:\n    squaremap: false\n  label: \"Edge\"\n  hide-by-default: true\n  color: 00FF00\n  weight: 5\n  priority: 7\n";
+        let reply = "true\ttrue\ttrue\tfalse\tEdge\ttrue\t00FF00\t5\t7";
+        assert_eq!(Options::from_service(reply), Some(Options::parse(text)));
+        assert_eq!(Options::from_service("true\ttrue"), None);
+        assert_eq!(Options::from_service("true\ttrue\ttrue\ttrue\tL\tfalse\tzzzzzz\t3\t0"), None);
+    }
+
     use super::*;
     use serde_json::Value;
 
