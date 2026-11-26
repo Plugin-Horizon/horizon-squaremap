@@ -777,7 +777,7 @@ impl Hooks for Mod {
     }
 
     fn tab_complete(&self, _: &mut dyn ServerHost, e: &mut TabCompleteEvent<'_>) {
-        for text in sm::commands::world_completions(e.command) {
+        for text in sm::commands::world_completions(e.command).into_iter().chain(sm::commands::other_completions(e.command)) {
             if !e.suggestions.iter().any(|s| s.text == text) {
                 e.suggestions.push(Suggestion::new((e.range[0], e.range[1]), text));
             }

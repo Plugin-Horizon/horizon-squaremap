@@ -444,7 +444,7 @@ impl Default for Settings {
             update_checker: true,
             language_file: "lang-en.yml".into(),
             web_address: "http://localhost:8080".into(),
-            web_directory: WebDirectory { path: "squaremap/web".into(), auto_update: true },
+            web_directory: WebDirectory { path: "web".into(), auto_update: true },
             internal_webserver: Webserver::default(),
             ui: Ui::default(),
             image_quality: ImageQuality::default(),

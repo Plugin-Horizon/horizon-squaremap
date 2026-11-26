@@ -931,6 +931,29 @@ pub fn world_completions(command: &str) -> Vec<String> {
     out
 }
 
+/// The completions of the other arguments: `help <query>` lists every command's syntax (`squaremap <syntax>`, cloud's
+/// help-query suggestions) and `progresslogging rate` the numbers 1 to 9 (cloud's integer suggestions).
+pub fn other_completions(command: &str) -> Vec<String> {
+    let words: Vec<&str> = command.split(' ').collect();
+    if !is_ours(command) {
+        return Vec::new();
+    }
+    let sub = words.get(1).map(|w| w.to_ascii_lowercase()).unwrap_or_default();
+    match (words.len(), sub.as_str()) {
+        (3, "help") => {
+            let typed = words[2].to_ascii_lowercase();
+            HELP.iter()
+                .map(|e| format!("squaremap {}", e.syntax))
+                .filter(|s| s.to_ascii_lowercase().starts_with(&typed))
+                .collect()
+        }
+        (4, "progresslogging") if words[2].eq_ignore_ascii_case("rate") => {
+            (1..=9).map(|n| n.to_string()).filter(|n| n.starts_with(words[3])).collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
 /// A one-line status of each level's render, for operators (`/squaremap` has no status
 /// command; used by the game side's log if wanted).
 pub fn status_lines() -> Vec<String> {
@@ -947,6 +970,20 @@ pub fn status_lines() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn help_and_the_progress_rate_complete_as_paper_does() {
+        let help = other_completions("map help ");
+        assert_eq!(help.len(), 16);
+        assert_eq!(help[0], "squaremap cancelrender [world]");
+        assert!(help.contains(&"squaremap progresslogging rate <seconds>".to_owned()));
+        assert!(help.iter().any(|h| h.starts_with("squaremap radiusrender")));
+        assert_eq!(other_completions("squaremap help sho"), Vec::<String>::new());
+        assert_eq!(other_completions("squaremap help sq").len(), 16);
+        assert_eq!(other_completions("map progresslogging rate "), ["1", "2", "3", "4", "5", "6", "7", "8", "9"]);
+        assert!(other_completions("map progresslogging toggle ").is_empty());
+        assert!(other_completions("tp help ").is_empty());
+    }
+
     #[test]
     fn command_failed_hover_only_with_detail() {
         let plain = command_failed(None);

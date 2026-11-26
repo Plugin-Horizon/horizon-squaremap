@@ -278,6 +278,13 @@ pub fn resume_renders() {
     with(|rt| rt.resume_jobs());
 }
 
+/// `settings.web-directory.path`: absolute as given, else under the plugin's data folder (`plugins/squaremap/web`,
+/// where the original keeps the frontend and the tiles).
+pub fn web_directory(path: &str) -> PathBuf {
+    let path = Path::new(path);
+    if path.is_absolute() { path.to_path_buf() } else { Path::new("plugins/squaremap").join(path) }
+}
+
 /// Opens the map for a world folder with the game's block states and biomes, and what the
 /// game knows of biomes beyond the saved data (`env`). Resumes renders a stop interrupted.
 pub fn start(world_dir: &Path, states: Vec<RawState>, biomes: Vec<RawBiome>, env: WorldEnv) -> Result<(), String> {
@@ -290,8 +297,7 @@ fn start_with(args: StartArgs) -> Result<(), String> {
     stop();
     let StartArgs { dir: world_dir, states, biomes, env } = args;
     let config = config();
-    let web_path = Path::new(&config.settings.web_directory.path);
-    let web = if web_path.is_absolute() { web_path.to_path_buf() } else { world_dir.join(web_path) };
+    let web = web_directory(&config.settings.web_directory.path);
     if config.settings.web_directory.auto_update {
         write_frontend(&web).map_err(|e| format!("writing the web folder {}: {e}", web.display()))?;
     }
@@ -1171,6 +1177,13 @@ mod tests {
 
     fn open_ids() -> Vec<String> {
         open_levels().into_iter().map(|(_, id)| id).collect()
+    }
+
+    #[test]
+    fn the_web_folder_is_under_the_plugins_data_folder() {
+        assert_eq!(web_directory("web"), Path::new("plugins/squaremap/web"));
+        assert_eq!(web_directory("/srv/map"), Path::new("/srv/map"));
+        assert_eq!(crate::horizon_squaremap::config::Settings::default().web_directory.path, "web");
     }
 
     #[test]
