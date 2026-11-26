@@ -10,6 +10,7 @@
 //! `serverconfig/squaremap-server.toml` wins). The web server binds 127.0.0.1 by default.
 
 pub mod horizon_squaremap;
+mod cmdkit;
 mod chunky_border;
 use horizon_squaremap as sm;
 use mod_api::{
@@ -654,10 +655,14 @@ impl Hooks for Mod {
         }
     }
 
+    fn register(&self, registrar: &mut dyn mod_api::Registrar, _: &mod_api::RegistrationContext) {
+        cmdkit::register(registrar);
+    }
+
     fn register_commands(&self, _: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
         for (usage, level) in sm::commands::usages() {
             if sm::commands::permission_node(&usage).is_none() {
-                event.commands.push(Command::op(&usage.replace("word?", "word"), level));
+                event.commands.push(Command::op(&cmdkit::ask(&usage.replace("word?", "word"), "squaremap"), level));
             }
         }
     }
@@ -669,7 +674,7 @@ impl Hooks for Mod {
         // decides when no permissions mod answers. The bare label and `confirm` have none (register_commands).
         for (usage, level) in sm::commands::usages() {
             if let Some(name) = sm::commands::permission_node(&usage) {
-                event.commands.push(Command::op(&usage.replace("word?", "word"), level).with_node(&node(&name)));
+                event.commands.push(Command::op(&cmdkit::ask(&usage.replace("word?", "word"), "squaremap"), level).with_node(&node(&name)));
             }
         }
     }
@@ -698,6 +703,7 @@ impl Hooks for Mod {
             match &argument.value {
                 CommandArgumentValue::String(s) => words.push(s.clone()),
                 CommandArgumentValue::Integer(i) => words.push(i.to_string()),
+                CommandArgumentValue::Custom { value, .. } => words.push(value.clone()),
                 CommandArgumentValue::Player(p) => words.extend(p.name(&*host)),
                 _ => {}
             }
