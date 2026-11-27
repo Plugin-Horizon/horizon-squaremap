@@ -4,13 +4,14 @@
 //! missing on arismoko and what each fallback loses.
 //!
 //! The map starts in `server_started` only once the block-state and biome tables can be read
-//! (`render_tables`, TODO(arismoko-api: block_state_table)). Until then the commands answer, the
-//! config is read and the web server does not start.
+//! (`render_tables`). Until then the commands answer, the config is read and the web server does not start.
 //!
 //! Config: `config/squaremap-server.toml` (registered as a Server config; a world's
 //! `serverconfig/squaremap-server.toml` wins). The web server binds 127.0.0.1 by default.
 
 pub mod horizon_squaremap;
+mod cmdkit;
+mod chunky_border;
 use horizon_squaremap as sm;
 use mod_api::{
     BlockChangedEvent, BlockMetadata, ChunkLoadEvent, ChunkUnloadEvent, Command, CommandArgumentValue, CommandSource,
@@ -19,16 +20,67 @@ use mod_api::{
     LevelLoadEvent, LevelUnloadEvent, LivingRef, NodeDefault, RegistryEntry,
     PermissionGatherNodesEvent, PermissionLevel, PermissionNode, PermissionValueType, PlayerCommandEvent,
     RegisterCommandsEvent, RegisterNodeCommandsEvent, RegisterConfigsEvent, RunModCommandEvent, ServerHost, ServerStartedEvent,
-    ServerStoppingEvent, ServerTickEvent, ServerTickPhase, Suggestion, TabCompleteEvent, Text, WorldSavedEvent,
+    ChunkRef, Heightmap, LevelRef, LevelTickPreEvent,
+    ModServiceCallEvent, ServerStoppingEvent, ServerTickEvent, ServerTickPhase, Suggestion, TabCompleteEvent, Text, WorldSavedEvent,
 };
 use mod_api::text::{TextClick, TextHover, TextStyle};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 const ID: &str = "squaremap";
 
+/// Whether the chunky mod has accepted `subscribe squaremap` (its border events then arrive at `squaremap:chunky_event`).
+static CHUNKY_SUBSCRIBED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Ticks between two tries to subscribe while the chunky mod is absent (five seconds).
+const SUBSCRIBE_EVERY: u64 = 100;
+
+/// ChunkyBorder's `map-options`, read when a border is drawn (`config/chunkyborder/config.yml` or `.toml`).
+fn border_options(host: &mut dyn ServerHost) -> chunky_border::Options {
+    // The chunky mod owns and validates the keys; the file is read only when it does not answer.
+    if let Some(o) = host
+        .commands()
+        .call_mod_service("chunky:api", b"map_options")
+        .ok()
+        .and_then(|r| String::from_utf8(r).ok())
+        .and_then(|r| chunky_border::Options::from_service(&r))
+    {
+        return o;
+    }
+    border_options_from_file()
+}
+
+/// The same keys read from ChunkyBorder's own file: used when the chunky mod does not answer, and from inside its
+/// event callback (calling it back from there could re-enter it).
+fn border_options_from_file() -> chunky_border::Options {
+    let dir = Path::new("config/chunkyborder");
+    let text = std::fs::read_to_string(dir.join("config.toml")).or_else(|_| std::fs::read_to_string(dir.join("config.yml")));
+    text.map(|t| chunky_border::Options::parse(&t)).unwrap_or_default()
+}
+
+/// Subscribes to the chunky mod's border events once it is there, and draws the borders it already has.
+/// Every failure (no such mod, no such service) is silent and tried again later.
+fn subscribe_to_chunky(host: &mut dyn ServerHost) {
+    use std::sync::atomic::Ordering;
+    if CHUNKY_SUBSCRIBED.load(Ordering::Relaxed) {
+        return;
+    }
+    if host.commands().call_mod_service("chunky:api", format!("subscribe\t{ID}").as_bytes()).is_err() {
+        return;
+    }
+    CHUNKY_SUBSCRIBED.store(true, Ordering::Relaxed);
+    let options = border_options(host);
+    for (_, dimension) in sm::open_levels() {
+        let line = format!("border_get\t{}", chunky_border::world_of(&dimension));
+        let Ok(reply) = host.commands().call_mod_service("chunky:api", line.as_bytes()) else { continue };
+        let Ok(reply) = String::from_utf8(reply) else { continue };
+        let fields: Vec<&str> = reply.trim().split('\t').collect();
+        chunky_border::apply(&dimension, chunky_border::parse_border(&fields).as_ref(), &options);
+    }
+}
+
 /// Every permission node the map checks: the subcommands' (`squaremap.command.<sub>`, the ones
 /// `commands::usages` lists) and the two `.others` nodes. Declared in `permission_gather_nodes`.
-const NODES: [&str; 13] = [
+const NODES: [&str; 14] = [
     "squaremap.command.help",
     "squaremap.command.cancelrender",
     "squaremap.command.fullrender",
@@ -42,6 +94,7 @@ const NODES: [&str; 13] = [
     "squaremap.command.link",
     "squaremap.command.hide.others",
     "squaremap.command.show.others",
+    sm::commands::STACKTRACE_NODE,
 ];
 
 /// A Boolean permission node named `name`, as the map's commands ask it.
@@ -56,6 +109,26 @@ const DATA: &str = "plugins/squaremap";
 /// `config.yml`, then `advanced.yml`, laid over the TOML config (`sm::set_yaml_layers`).
 fn read_yaml_layers() -> Vec<String> {
     ["config.yml", "advanced.yml"].iter().filter_map(|f| std::fs::read_to_string(Path::new(DATA).join(f)).ok()).collect()
+}
+
+/// Writes a setting back (`progresslogging toggle|rate`): into the TOML config, and into `config.yml` where it has the
+/// key (it is laid over the TOML one). Text edits, so comments stay. A world's `serverconfig/` copy is kept in step.
+fn persist_setting(path: &[&str], value: &str) {
+    let toml_files = [PathBuf::from("config/squaremap-server.toml"), level_dir().join("serverconfig/squaremap-server.toml")];
+    let (key, section) = (path[path.len() - 1], path[..path.len() - 1].join("."));
+    for file in toml_files {
+        if let Ok(text) = std::fs::read_to_string(&file) {
+            if let Some(new) = sm::persist::set_toml(&text, &section, key, value) {
+                let _ = std::fs::write(&file, new);
+            }
+        }
+    }
+    let yaml = Path::new(DATA).join("config.yml");
+    if let Ok(text) = std::fs::read_to_string(&yaml) {
+        if let Some(new) = sm::persist::set_yaml(&text, path, value) {
+            let _ = std::fs::write(&yaml, new);
+        }
+    }
 }
 
 /// The language file `settings.language-file` names, from `locale/` (its file name only); none leaves the English text.
@@ -127,9 +200,7 @@ fn resources_dir() -> Option<PathBuf> {
 /// worldgen files (`sm::vanilla`); the host answers each block's states and their map colours.
 /// Cause of "not started" before this: the function returned None unconditionally, so `server_started`
 /// never reached `sm::start` (no hook, level-name or capability problem).
-// TODO(arismoko-api: biome_zoom): the biome zoom (`quart_at_block`) and the swamp grass noise the
-//   core uses for chunks it reads from the region files: `WorldEnv::plain()` (unfuzzed quart cell,
-//   flat swamp grass) stands in.
+/// The world env (biome zoom and swamp grass noise) is computed from the overworld's seed (`sm::noise`).
 fn render_tables(host: &dyn ServerHost) -> Option<(Vec<sm::RawState>, Vec<sm::RawBiome>, sm::WorldEnv)> {
     let dir = resources_dir()?;
     let mut states = Vec::new();
@@ -181,7 +252,28 @@ fn render_tables(host: &dyn ServerHost) -> Option<(Vec<sm::RawState>, Vec<sm::Ra
     if states.is_empty() || biomes.is_empty() {
         return None;
     }
-    Some((states, biomes, sm::WorldEnv::plain()))
+    Some((states, biomes, world_env(host)))
+}
+
+/// `BiomeManager`'s zoom and the swamp grass noise for chunks read from the region files. The zoom is seeded by
+/// the world seed (one for every level); without a loaded overworld the plain quart cell stands in.
+fn world_env(host: &dyn ServerHost) -> sm::WorldEnv {
+    let seed = host.level("minecraft:overworld").and_then(|l| l.seed(host));
+    let swamp = sm::noise::SwampNoise::new();
+    match seed {
+        Some(seed) => {
+            let biome_seed = sm::noise::obfuscate_seed(seed);
+            sm::WorldEnv {
+                zoom: Box::new(move |x, y, z| sm::noise::quart_at_block(biome_seed, x, y, z)),
+                swamp_grass: Box::new(move |_, x, z| swamp.grass(x, z)),
+            }
+        }
+        None => {
+            let mut env = sm::WorldEnv::plain();
+            env.swamp_grass = Box::new(move |_, x, z| swamp.grass(x, z));
+            env
+        }
+    }
 }
 
 /// The border of a dimension's level and the world spawn column (`LevelData.getRespawnData`, one spawn
@@ -215,7 +307,11 @@ fn sync_levels(host: &mut dyn ServerHost, add: Option<&str>, remove: Option<&str
     sm::set_open_levels(&ids);
     for id in &ids {
         let (Some(w), Some(level)) = (sm::world_index(id), host.level(id)) else { continue };
-        if let Some((min_y, height)) = level.height(&*host) {
+        // The dimension type (`LevelRef.dimension_type`) gives the ceiling flag and the build height of a custom
+        // level; the plain height range and the nether's id stand in when the host has none.
+        if let Some(ty) = level.dimension_type(&*host) {
+            sm::level_shape(w, ty.min_y, ty.min_y + ty.height, ty.has_ceiling);
+        } else if let Some((min_y, height)) = level.height(&*host) {
             sm::level_shape(w, min_y, min_y + height, id.as_str() == "minecraft:the_nether");
         }
     }
@@ -277,8 +373,8 @@ fn publish_players(host: &dyn ServerHost) {
             health: living.health(host).unwrap_or(0.0),
             // `Attributes.ARMOR` with every modifier, as the game answers it.
             armor: living.attribute_value(host, "minecraft:armor").map(|v| v.floor() as i32),
-            // HMOD-GAP(nickname): Horizon main can set a nickname but has no getter, so the map shows the real name.
-            display_name: None,
+            // `use-display-names`: the nickname `player_set_nickname` shows in place of the name, if any.
+            display_name: p.nickname(host).flatten(),
         });
     }
     sm::publish_players(&list, max_players(host));
@@ -317,7 +413,7 @@ fn prefix() -> Vec<Text> {
 /// One piece of text with squaremap's colour, click and hover.
 fn styled(text: &str, color: Option<u32>, click: Option<TextClick>, hover: Option<&str>) -> Text {
     let mut style = TextStyle::default();
-    // TODO(arismoko-api: text_colour_format): colours are sent as `#RRGGBB`; check Horizon accepts that form.
+    // `TextStyle.color` takes `#RRGGBB`.
     style.color = color.map(|c| format!("#{c:06X}"));
     style.click = click;
     style.hover = hover.map(|h| TextHover::Text(Box::new(Text::literal(h))));
@@ -332,7 +428,7 @@ fn line_text(line: &sm::commands::Line) -> Text {
             text = text.append(piece);
         }
     }
-    for part in &line.parts {
+    for part in &line.expanded() {
         let click = part.click.as_ref().map(|c| match c {
             sm::commands::Click::Run(command) => TextClick::RunCommand(command.clone()),
             sm::commands::Click::Open(url) => TextClick::OpenUrl(url.clone()),
@@ -340,6 +436,78 @@ fn line_text(line: &sm::commands::Line) -> Text {
         text = text.append(styled(&part.text, part.color, click, part.hover.as_deref()));
     }
     text
+}
+
+/// The chunks decoded for this level tick: a due chunk's snapshot shares its neighbours with the next one's.
+#[derive(Default)]
+struct ChunkCache {
+    chunks: std::collections::HashMap<(i32, i32), Option<Arc<sm::region::DiskChunk>>>,
+}
+
+/// A loaded chunk as the scanner reads it: its sections and `WORLD_SURFACE` heights, decoded once per tick.
+fn decode_loaded(
+    host: &dyn ServerHost,
+    level: LevelRef,
+    cx: i32,
+    cz: i32,
+    ids: &sm::region::Ids,
+    shape: sm::region::Shape,
+    cache: &mut ChunkCache,
+) -> Option<Arc<sm::region::DiskChunk>> {
+    if let Some(hit) = cache.chunks.get(&(cx, cz)) {
+        return hit.clone();
+    }
+    let chunk = ChunkRef::new(level, [cx, cz]);
+    let decoded = chunk.sections(host).and_then(|sections| {
+        let sections = sections
+            .into_iter()
+            .map(|s| sm::region::LiveSection {
+                y: s.y,
+                block_palette: s.block_palette,
+                blocks: s.blocks,
+                biome_palette: s.biome_palette,
+                biomes: s.biomes,
+            })
+            .collect();
+        let heights = chunk.heightmap(host, Heightmap::WorldSurface);
+        sm::region::DiskChunk::from_live(sections, heights.as_deref(), ids, shape).ok().map(Arc::new)
+    });
+    if cache.chunks.len() >= 64 {
+        cache.chunks.clear();
+    }
+    cache.chunks.insert((cx, cz), decoded.clone());
+    decoded
+}
+
+/// One due chunk of level `w`: see `level_tick_pre`.
+fn draw_due_chunk(host: &mut dyn ServerHost, level: LevelRef, w: usize, cx: i32, cz: i32, cache: &mut ChunkCache) {
+    if sm::is_loaded(w, cx, cz) {
+        if let Some((ids, env)) = sm::snapshot_tables() {
+            let shape = sm::level_shape_of(w);
+            let centre = decode_loaded(&*host, level, cx, cz, &ids, shape, cache);
+            if centre.is_some() {
+                let chunks = std::array::from_fn(|i| {
+                    let (dx, dz) = (i as i32 % 3 - 1, i as i32 / 3 - 1);
+                    if (dx, dz) == (0, 0) { centre.clone() } else { decode_loaded(&*host, level, cx + dx, cz + dz, &ids, shape, cache) }
+                });
+                sm::drawn(w, cx, cz);
+                sm::submit(w, Box::new(sm::region::DiskView::new(cx, cz, chunks, shape, env)));
+                return;
+            }
+        }
+        // No snapshot: the chunk is drawn from the region files after the next world save.
+        sm::due_chunk(w, cx, cz);
+        return;
+    }
+    // Unloaded: its save may still wait for the region writer; draw it once the save is as new as the change.
+    let changed = sm::changed_second(w, cx, cz);
+    match level.saved_chunk_modified(&*host, [cx, cz]) {
+        Some(saved) if saved < changed => sm::redirty(w, cx, cz),
+        _ => {
+            sm::drawn(w, cx, cz);
+            sm::due_chunk(w, cx, cz);
+        }
+    }
 }
 
 #[derive(Default)]
@@ -365,6 +533,7 @@ impl Hooks for Mod {
     }
 
     fn server_started(&self, host: &mut dyn ServerHost, _: &mut ServerStartedEvent) {
+        sm::set_persist(persist_setting);
         sync_levels(host, None, None);
         match render_tables(&*host) {
             Some((states, biomes, env)) => match sm::start(&level_dir(), states, biomes, env) {
@@ -382,7 +551,31 @@ impl Hooks for Mod {
         sm::world_closed();
     }
 
+    /// The service other mods call: `squaremap:chunky_event`, one event line of the chunky mod (a border that changed
+    /// or went away is drawn or removed as a layer).
+    fn mod_service_call(&self, _: &mut dyn ServerHost, event: &mut ModServiceCallEvent<'_>) -> Option<mod_api::PayloadBytes> {
+        if event.service != "squaremap:chunky_event" {
+            return None;
+        }
+        let line = std::str::from_utf8(&event.payload.0).ok()?;
+        if let Some((world, border)) = chunky_border::parse_event(line)
+            && let Some(dimension) = chunky_border::dimension_of(&world)
+        {
+            chunky_border::apply(&dimension, border.as_ref(), &border_options_from_file());
+        }
+        Some(mod_api::PayloadBytes(b"ok".to_vec()))
+    }
+
     fn server_tick(&self, host: &mut dyn ServerHost, event: &mut ServerTickEvent<'_>) {
+        if let ServerTickPhase::ServerTickEnd { world_running: true, .. } = event.phase
+            && !CHUNKY_SUBSCRIBED.load(std::sync::atomic::Ordering::Relaxed)
+            && sm::running()
+        {
+            static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            if CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % SUBSCRIBE_EVERY == 0 {
+                subscribe_to_chunky(host);
+            }
+        }
         if !matches!(event.phase, ServerTickPhase::ServerTickEnd { world_running: true, .. }) || !sm::running() {
             return;
         }
@@ -390,12 +583,6 @@ impl Hooks for Mod {
             // A level whose map is disabled is not drawn and publishes nothing.
             if !sm::world_enabled(w) {
                 continue;
-            }
-            // TODO(arismoko-api: chunk_snapshot): loaded chunks are not snapshotted. A changed chunk that is still
-            // loaded is drawn from the region files once the next world save has written it (`world_saved`); one
-            // that was unloaded meanwhile is drawn from them at once.
-            for (cx, cz) in sm::due_chunks(w) {
-                sm::due_chunk(w, cx, cz);
             }
             if sm::markers_due(w) {
                 if let Some((border, spawn)) = level_border(host, &dimension) {
@@ -405,6 +592,26 @@ impl Hooks for Mod {
         }
         if sm::players_due() {
             publish_players(&*host);
+        }
+    }
+
+    /// The changed chunks of a level are drawn as it ticks, with the level in place: a loaded one from a snapshot of
+    /// its sections and heights (`chunk_sections`, `chunk.heightmap`, and its eight neighbours), at once; an unloaded
+    /// one from the region files, once its save is newer than its change (`level.saved_chunk_modified`).
+    fn level_tick_pre(&self, host: HostSide, event: &mut LevelTickPreEvent) {
+        let HostSide::Server(host) = host else { return };
+        if !sm::running() {
+            return;
+        }
+        let level = event.level;
+        let dimension = level.dimension_id().to_string();
+        let Some(w) = sm::open_world_index(&dimension) else { return };
+        if !sm::world_enabled(w) {
+            return;
+        }
+        let mut cache = ChunkCache::default();
+        for (cx, cz) in sm::due_chunks(w) {
+            draw_due_chunk(host, level, w, cx, cz, &mut cache);
         }
     }
 
@@ -448,10 +655,14 @@ impl Hooks for Mod {
         }
     }
 
+    fn register(&self, registrar: &mut dyn mod_api::Registrar, _: &mod_api::RegistrationContext) {
+        cmdkit::register(registrar);
+    }
+
     fn register_commands(&self, _: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
         for (usage, level) in sm::commands::usages() {
             if sm::commands::permission_node(&usage).is_none() {
-                event.commands.push(Command::op(&usage.replace("word?", "word"), level));
+                event.commands.push(Command::op(&cmdkit::ask(&usage.replace("word?", "word"), "squaremap"), level));
             }
         }
     }
@@ -463,7 +674,7 @@ impl Hooks for Mod {
         // decides when no permissions mod answers. The bare label and `confirm` have none (register_commands).
         for (usage, level) in sm::commands::usages() {
             if let Some(name) = sm::commands::permission_node(&usage) {
-                event.commands.push(Command::op(&usage.replace("word?", "word"), level).with_node(&node(&name)));
+                event.commands.push(Command::op(&cmdkit::ask(&usage.replace("word?", "word"), "squaremap"), level).with_node(&node(&name)));
             }
         }
     }
@@ -492,6 +703,7 @@ impl Hooks for Mod {
             match &argument.value {
                 CommandArgumentValue::String(s) => words.push(s.clone()),
                 CommandArgumentValue::Integer(i) => words.push(i.to_string()),
+                CommandArgumentValue::Custom { value, .. } => words.push(value.clone()),
                 CommandArgumentValue::Player(p) => words.extend(p.name(&*host)),
                 _ => {}
             }
@@ -534,7 +746,26 @@ impl Hooks for Mod {
             }
             _ => return Flow::Continue,
         };
-        let lines = sm::commands::command(&line, &sender, &online(&*host));
+        let online_now = online(&*host);
+        let lines = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sm::commands::command(&line, &sender, &online_now))) {
+            Ok(lines) => lines,
+            Err(panic) => {
+                // ExceptionHandler.commandExecution: log it, tell the sender, detail on hover for the stacktrace node.
+                let detail = panic
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "unknown panic".into());
+                eprintln!("[squaremap] An unexpected error occurred during command execution: {detail}");
+                let may_see = match &event.source {
+                    CommandSource::Player { player, .. } => {
+                        player.permission_bool(&mut *host, &node(sm::commands::STACKTRACE_NODE)).unwrap_or(false)
+                    }
+                    _ => true,
+                };
+                vec![sm::commands::command_failed(may_see.then_some(detail.as_str()))]
+            }
+        };
         if line.split_whitespace().nth(1).is_some_and(|w| w.eq_ignore_ascii_case("reload")) {
             // `reload` also reads the language file again.
             load_language();
@@ -546,8 +777,7 @@ impl Hooks for Mod {
     }
 
     fn tab_complete(&self, _: &mut dyn ServerHost, e: &mut TabCompleteEvent<'_>) {
-        // TODO(arismoko-api: verify): event field names `command`, `range`, `suggestions` are assumed.
-        for text in sm::commands::world_completions(e.command) {
+        for text in sm::commands::world_completions(e.command).into_iter().chain(sm::commands::other_completions(e.command)) {
             if !e.suggestions.iter().any(|s| s.text == text) {
                 e.suggestions.push(Suggestion::new((e.range[0], e.range[1]), text));
             }
