@@ -1,6 +1,6 @@
 id = "squaremap"
 name = "squaremap"
-version = "0.4.0"
+version = "1.001.0"
 description = "Web map for Horizon: tiles of the overworld, nether and end in squaremap's format, served from 127.0.0.1."
 authors = ["LionSpacer"]
 api = "0.2"
