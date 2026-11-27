@@ -59,7 +59,6 @@ pub fn usages() -> Vec<(String, u8)> {
     labels.extend(c.main_command_aliases.iter().filter(|a| **a != c.main_command_label).cloned());
     let mut out = Vec::new();
     for l in labels.iter().filter(|l| !l.is_empty() && !l.contains(char::is_whitespace)) {
-        out.push((l.clone(), 0));
         out.push((format!("{l} confirm"), 0));
         // World names are `minecraft:<name>` keys, which a `word` argument refuses (no colon); a world that
         // comes last is `text` instead. `radiusrender` has the world first, so it stays `word?` (`overworld`, `the_nether`).
@@ -1015,7 +1014,9 @@ mod tests {
     #[test]
     fn usages_cover_label_and_alias() {
         let u = usages();
-        assert!(u.contains(&("squaremap".into(), 0)));
+        // The label alone has no handler on Paper: Brigadier answers unknown/incomplete command, so no bare usage is registered.
+        assert!(!u.iter().any(|(usage, _)| usage == "squaremap" || usage == "map"), "{u:?}");
+        assert!(u.contains(&("squaremap confirm".into(), 0)));
         assert!(u.contains(&("map confirm".into(), 0)));
         assert!(u.contains(&("map fullrender [world:text]".into(), OP_LEVEL)));
         assert!(is_ours("map hide") && is_ours("/SquareMap") && !is_ours("maps"));
