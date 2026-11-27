@@ -18,6 +18,8 @@ pub struct Config {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
 pub struct Settings {
+    pub debug_mode: bool,
+    pub update_checker: bool,
     /// The language file under `plugins/squaremap/locale/` (`settings.language-file`).
     pub language_file: String,
     pub web_address: String,
@@ -72,6 +74,7 @@ pub struct Webserver {
     pub enabled: bool,
     pub bind: String,
     pub port: u16,
+    pub flush_json_immediately: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -121,6 +124,9 @@ pub struct MapConfig {
     pub markers: Markers,
     pub visibility_limits: Vec<VisibilityLimit>,
     pub render: Render,
+    pub image_saving: ImageSaving,
+    /// Before squaremap 1.4: `map.max-render-threads` (-1 = default), the workers of full and radius renders.
+    pub max_render_threads: Option<Auto>,
     /// The limits as shapes, with the world border of when they were resolved
     /// ([`MapConfig::resolve`]).
     #[serde(skip)]
@@ -198,10 +204,146 @@ pub struct VisibilityLimit {
     pub points: Vec<String>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
 pub struct Render {
+    pub full: RenderLimits,
+    pub radius: RenderLimits,
     pub background: Background,
+}
+
+/// An integer setting that may also read `"default"` (`RenderConfig.automatic`): the raw value as the file has it.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum Auto {
+    Number(i64),
+    Text(String),
+}
+
+impl Default for Auto {
+    fn default() -> Self {
+        Auto::Text("default".into())
+    }
+}
+
+impl Auto {
+    /// `RenderConfig.parse`: `default` (when `automatic`) and anything unusable give `fallback`, with a warning for the
+    /// unusable ones; a value under `minimum` too.
+    pub fn resolve(&self, path: &str, fallback: usize, minimum: usize, automatic: bool) -> usize {
+        let parsed = match self {
+            Auto::Number(n) => Some(*n),
+            Auto::Text(t) if automatic && t.eq_ignore_ascii_case("default") => return fallback,
+            Auto::Text(t) => t.trim().parse::<i64>().ok(),
+        };
+        let shown = match self {
+            Auto::Number(n) => n.to_string(),
+            Auto::Text(t) => t.clone(),
+        };
+        match parsed {
+            None => {
+                let or_default = if automatic { " or 'default'" } else { "" };
+                eprintln!("[squaremap] {path} must be an integer{or_default}; using {fallback} instead of '{shown}'");
+                fallback
+            }
+            Some(n) if n < minimum as i64 => {
+                eprintln!("[squaremap] {path} must be at least {minimum}; using {fallback} instead of {n}");
+                fallback
+            }
+            Some(n) => n as usize,
+        }
+    }
+}
+
+/// `RenderConfig.automaticWorkers`: half the processors, then at most half of that above four.
+pub fn automatic_workers() -> usize {
+    let half = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2) / 2;
+    if half <= 4 {
+        if half <= 3 { 1 } else { 2 }
+    } else {
+        half / 2
+    }
+}
+
+/// Execution limits of one render mode (`RenderConfig`), as the file has them.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct RenderLimits {
+    pub workers: Auto,
+    pub max_chunk_requests: Auto,
+    pub max_active_chunks: Auto,
+    pub max_active_regions: Option<i64>,
+    pub max_column_chunks: Option<i64>,
+    pub idle_chunk_cache_size: Auto,
+}
+
+/// The limits of a mode once resolved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Limits {
+    pub workers: usize,
+    pub max_chunk_requests: usize,
+    pub max_active_chunks: usize,
+    pub max_active_regions: usize,
+    pub max_column_chunks: usize,
+    pub idle_chunk_cache_size: usize,
+}
+
+impl RenderLimits {
+    /// `new RenderConfig(config, path, defaultWorkers)`. `legacy_workers` is the pre-1.4 `map.max-render-threads`
+    /// (`-1` meant default), used where `workers` is not set.
+    pub fn resolve(&self, path: &str, default_workers: usize, legacy_workers: Option<&Auto>) -> Limits {
+        let workers_raw = match (&self.workers, legacy_workers) {
+            (Auto::Text(t), Some(old)) if t.eq_ignore_ascii_case("default") => match old {
+                Auto::Number(-1) => Auto::default(),
+                other => other.clone(),
+            },
+            (w, _) => w.clone(),
+        };
+        let workers = workers_raw.resolve(&format!("{path}.workers"), default_workers, 1, true);
+        let fixed = |v: Option<i64>, key: &str, fallback: usize, min: usize| {
+            v.map(Auto::Number).unwrap_or(Auto::Number(fallback as i64)).resolve(&format!("{path}.{key}"), fallback, min, false)
+        };
+        let max_active_chunks =
+            self.max_active_chunks.resolve(&format!("{path}.max-active-chunks"), workers * 64, 1, true);
+        Limits {
+            workers,
+            max_chunk_requests: self.max_chunk_requests.resolve(&format!("{path}.max-chunk-requests"), workers * 96, 1, true),
+            max_active_chunks,
+            max_active_regions: fixed(self.max_active_regions, "max-active-regions", 2, 1),
+            max_column_chunks: fixed(self.max_column_chunks, "max-column-chunks", 16, 1),
+            idle_chunk_cache_size: self.idle_chunk_cache_size.resolve(
+                &format!("{path}.idle-chunk-cache-size"),
+                max_active_chunks,
+                0,
+                true,
+            ),
+        }
+    }
+}
+
+/// `map.image-saving` (`ImageSavingConfig`).
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct ImageSaving {
+    pub workers: Option<i64>,
+    pub max_pending_images: Option<i64>,
+}
+
+impl Default for ImageSaving {
+    fn default() -> Self {
+        Self { workers: None, max_pending_images: None }
+    }
+}
+
+impl ImageSaving {
+    /// (workers, max pending images), each at least 1, defaults 2 and 100.
+    pub fn resolve(&self) -> (usize, usize) {
+        let get = |v: Option<i64>, key: &str, fallback: usize| {
+            v.map(Auto::Number)
+                .unwrap_or(Auto::Number(fallback as i64))
+                .resolve(&format!("map.image-saving.{key}"), fallback, 1, false)
+        };
+        (get(self.workers, "workers", 2), get(self.max_pending_images, "max-pending-images", 100))
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -210,6 +352,34 @@ pub struct Background {
     pub enabled: bool,
     pub interval_seconds: u64,
     pub max_chunks_per_interval: usize,
+    pub workers: Auto,
+}
+
+impl Background {
+    /// The background mode's workers: `max(1, automatic * 2 / 3)` unless set.
+    pub fn resolved_workers(&self, legacy: Option<&Auto>) -> usize {
+        let default = std::cmp::max(1, automatic_workers() * 2 / 3);
+        let raw = match (&self.workers, legacy) {
+            (Auto::Text(t), Some(old)) if t.eq_ignore_ascii_case("default") => match old {
+                Auto::Number(-1) => Auto::default(),
+                other => other.clone(),
+            },
+            (w, _) => w.clone(),
+        };
+        raw.resolve("map.render.background.workers", default, 1, true)
+    }
+}
+
+impl MapConfig {
+    /// The limits of a full render.
+    pub fn full_limits(&self) -> Limits {
+        self.render.full.resolve("map.render.full", automatic_workers(), self.max_render_threads.as_ref())
+    }
+
+    /// The limits of a radius render.
+    pub fn radius_limits(&self) -> Limits {
+        self.render.radius.resolve("map.render.radius", automatic_workers(), self.max_render_threads.as_ref())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -270,9 +440,11 @@ impl Default for Config {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            debug_mode: false,
+            update_checker: true,
             language_file: "lang-en.yml".into(),
             web_address: "http://localhost:8080".into(),
-            web_directory: WebDirectory { path: "squaremap/web".into(), auto_update: true },
+            web_directory: WebDirectory { path: "web".into(), auto_update: true },
             internal_webserver: Webserver::default(),
             ui: Ui::default(),
             image_quality: ImageQuality::default(),
@@ -302,7 +474,7 @@ impl Default for WebDirectory {
 
 impl Default for Webserver {
     fn default() -> Self {
-        Self { enabled: true, bind: "127.0.0.1".into(), port: 8080 }
+        Self { enabled: true, bind: "127.0.0.1".into(), port: 8080, flush_json_immediately: false }
     }
 }
 
@@ -338,6 +510,9 @@ impl Default for WorldConfig {
                 "minecraft:fern",
                 "minecraft:short_grass",
                 "minecraft:large_fern",
+                "minecraft:bush",
+                "minecraft:short_dry_grass",
+                "minecraft:tall_dry_grass",
             ]
             .map(String::from)
             .to_vec(),
@@ -379,6 +554,8 @@ impl Default for MapConfig {
             markers: Markers::default(),
             visibility_limits: Vec::new(),
             render: Render::default(),
+            image_saving: ImageSaving::default(),
+            max_render_threads: None,
             shapes: Vec::new(),
         }
     }
@@ -447,15 +624,9 @@ impl Default for VisibilityLimit {
     }
 }
 
-impl Default for Render {
-    fn default() -> Self {
-        Self { background: Background::default() }
-    }
-}
-
 impl Default for Background {
     fn default() -> Self {
-        Self { enabled: true, interval_seconds: 15, max_chunks_per_interval: 2048 }
+        Self { enabled: true, interval_seconds: 15, max_chunks_per_interval: 2048, workers: Auto::default() }
     }
 }
 
@@ -564,6 +735,55 @@ impl MapConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rust_defaults_match_the_original() {
+        let w = WorldConfig::default();
+        assert_eq!(w.invisible_blocks.len(), 7);
+        assert!(w.invisible_blocks.contains(&"minecraft:tall_dry_grass".to_string()));
+        let c = Config::parse("[settings]\ndebug-mode = true\nupdate-checker = false\n[settings.internal-webserver]\nflush-json-immediately = true\n").unwrap();
+        assert!(c.settings.debug_mode && !c.settings.update_checker);
+        assert!(c.settings.internal_webserver.flush_json_immediately);
+    }
+
+    #[test]
+    fn render_limits_follow_render_config() {
+        // defaults: workers 3 -> chunk requests 288, active chunks 192, cache size = active chunks
+        let l = RenderLimits::default();
+        let r = Auto::Number(3);
+        let one = RenderLimits { workers: r, ..RenderLimits::default() }.resolve("map.render.full", 1, None);
+        assert_eq!((one.workers, one.max_chunk_requests, one.max_active_chunks), (3, 288, 192));
+        assert_eq!((one.max_active_regions, one.max_column_chunks, one.idle_chunk_cache_size), (2, 16, 192));
+        let d = l.resolve("map.render.full", 4, None);
+        assert_eq!((d.workers, d.max_active_chunks), (4, 256));
+        // an invalid value falls back; zero is allowed only for the idle cache
+        let bad = RenderLimits {
+            workers: Auto::Text("many".into()),
+            max_active_regions: Some(0),
+            idle_chunk_cache_size: Auto::Number(0),
+            ..RenderLimits::default()
+        }
+        .resolve("map.render.radius", 2, None);
+        assert_eq!((bad.workers, bad.max_active_regions, bad.idle_chunk_cache_size), (2, 2, 0));
+        // the pre-1.4 key
+        let legacy = l.resolve("map.render.full", 4, Some(&Auto::Number(6)));
+        assert_eq!(legacy.workers, 6);
+        assert_eq!(l.resolve("map.render.full", 4, Some(&Auto::Number(-1))).workers, 4);
+    }
+
+    #[test]
+    fn render_limits_are_read_from_the_file() {
+        let c = Config::parse(
+            "[world-settings.default.map.render.full]\nworkers = 5\nmax-active-regions = 3\n[world-settings.default.map.render.background]\nworkers = \"default\"\n[world-settings.default.map.image-saving]\nworkers = 4\nmax-pending-images = 7\n",
+        )
+        .unwrap();
+        let w = c.world("minecraft:overworld");
+        let f = w.map.full_limits();
+        assert_eq!((f.workers, f.max_active_regions, f.max_active_chunks), (5, 3, 320));
+        assert_eq!(w.map.image_saving.resolve(), (4, 7));
+        assert_eq!(WorldConfig::default().map.image_saving.resolve(), (2, 100));
+        assert!(w.map.render.background.resolved_workers(None) >= 1);
+    }
 
     #[test]
     fn default_file_has_the_server_values() {

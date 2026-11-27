@@ -4,7 +4,7 @@
 //! north row is redrawn (its shading reads the chunk north of it). A job runs the plan on
 //! its own thread from the region files, saving progress after every region so a stopped
 //! render resumes on the next start.
-use crate::horizon_squaremap::config::WorldConfig;
+use crate::horizon_squaremap::config::{Limits, MapConfig, WorldConfig};
 use crate::horizon_squaremap::image::RegionImage;
 use crate::horizon_squaremap::region::{DiskCache, WorldEnv};
 use crate::horizon_squaremap::scan::scan_chunk_with;
@@ -343,10 +343,66 @@ pub struct Job {
     /// Writes a finished region image (on the render thread, which orders all writes).
     pub save: Box<dyn Fn(RegionImage) + Send>,
     pub control: Arc<Control>,
+    /// The mode's limits (`map.render.full` / `radius`): `workers` threads draw a batch of at most
+    /// `max_active_chunks` chunks at a time, each worker's cache keeps `idle_chunk_cache_size` chunks.
+    pub limits: Limits,
+    /// At most this many of the job's region images wait to be written (`map.image-saving.max-pending-images`).
+    pub max_unsaved: usize,
 }
 
-/// At most this many of a job's region images wait to be written.
-const MAX_UNSAVED: usize = 4;
+/// Reads and draws one saved chunk with its neighbours' biomes from `cache`.
+fn scan_saved(
+    cache: &mut DiskCache,
+    env: &Arc<WorldEnv>,
+    tables: &Tables,
+    map: &MapConfig,
+    cx: i32,
+    cz: i32,
+    row_only: bool,
+) -> Option<[u32; 256]> {
+    let view = cache.view(cx, cz, env.clone())?;
+    let cache = RefCell::new(cache);
+    let fallback = |qx: i32, qy: i32, qz: i32| cache.borrow_mut().noise_biome(qx, qy, qz);
+    Some(scan_chunk_with(&view, tables, map, row_only, Some(&fallback)))
+}
+
+/// Draws `todo` (chunk x, z, row only) on `workers` threads, each with a cache of its own. The results come back
+/// with the read errors; a halted job returns what was drawn so far.
+fn scan_parallel(
+    job: &Job,
+    todo: &[(i32, i32, bool)],
+    workers: usize,
+) -> (Vec<(i32, i32, [u32; 256])>, Vec<((i32, i32), String)>) {
+    // Borrow the parts the workers need one by one: the job's closures are not `Sync`.
+    let (c, env, tables, map) = (&job.control, &job.env, &*job.tables, &job.config.map);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|t| {
+                let mut cache = job.cache.fork();
+                scope.spawn(move || {
+                    let mut drawn = Vec::new();
+                    let mut i = t;
+                    while i < todo.len() && !c.halted() {
+                        let (cx, cz, row_only) = todo[i];
+                        if let Some(px) = scan_saved(&mut cache, env, tables, map, cx, cz, row_only) {
+                            drawn.push((cx, cz, px));
+                        }
+                        i += workers;
+                    }
+                    (drawn, std::mem::take(&mut cache.errors))
+                })
+            })
+            .collect();
+        let (mut drawn, mut errors) = (Vec::new(), Vec::new());
+        for h in handles {
+            if let Ok((d, e)) = h.join() {
+                drawn.extend(d);
+                errors.extend(e);
+            }
+        }
+        (drawn, errors)
+    })
+}
 
 /// Runs the job to its end; true when it completed.
 pub fn run(mut job: Job) -> bool {
@@ -368,39 +424,59 @@ pub fn run(mut job: Job) -> bool {
         let mut drew = false;
         // Region files change under a running server: read their headers afresh.
         job.cache.forget_files();
-        for (cx, cz, row_only) in work.chunks() {
+        let all = work.chunks();
+        let batch = job.limits.max_active_chunks.max(1);
+        for slice in all.chunks(batch) {
             loop {
                 if c.halted() {
                     outcome_complete = false;
                     break 'regions;
                 }
-                if !c.paused.load(Ordering::Relaxed) && c.unsaved.load(Ordering::Relaxed) < MAX_UNSAVED {
+                if !c.paused.load(Ordering::Relaxed) && c.unsaved.load(Ordering::Relaxed) < job.max_unsaved {
                     break;
                 }
                 progress.tick(&c, &job.world_id);
                 std::thread::sleep(Duration::from_millis(100));
             }
-            if (job.loaded)(cx, cz) {
-                (job.live)(cx, cz);
-            } else if job.cache.exists(cx, cz) {
-                let view = job.cache.view(cx, cz, job.env.clone());
-                if let Some(view) = view {
-                    let cache = RefCell::new(&mut job.cache);
-                    let fallback = |qx: i32, qy: i32, qz: i32| cache.borrow_mut().noise_biome(qx, qy, qz);
-                    let px = scan_chunk_with(&view, &job.tables, &job.config.map, row_only, Some(&fallback));
+            // Loaded chunks go to the live renderer; the saved ones are read and drawn.
+            let mut todo = Vec::new();
+            for &(cx, cz, row_only) in slice {
+                if (job.loaded)(cx, cz) {
+                    (job.live)(cx, cz);
+                } else if job.cache.exists(cx, cz) {
+                    todo.push((cx, cz, row_only));
+                }
+            }
+            let workers = job.limits.workers.min(todo.len()).max(1);
+            if workers <= 1 {
+                for &(cx, cz, row_only) in &todo {
+                    if c.halted() {
+                        break;
+                    }
+                    if let Some(px) = scan_saved(&mut job.cache, &job.env, &job.tables, &job.config.map, cx, cz, row_only) {
+                        image.put_chunk(cx, cz, &px);
+                        drew = true;
+                    }
+                }
+            } else {
+                let (drawn, errors) = scan_parallel(&job, &todo, workers);
+                for (cx, cz, px) in drawn {
                     image.put_chunk(cx, cz, &px);
                     drew = true;
                 }
+                job.cache.errors.extend(errors);
             }
             for ((x, z), e) in job.cache.errors.drain(..) {
                 if c.failed_chunks.fetch_add(1, Ordering::Relaxed) < 20 {
                     eprintln!("[squaremap] exception mapping chunk at [{x}, {z}] in {}: {e}", job.world_id);
                 }
             }
-            if !row_only {
-                c.done_chunks.fetch_add(1, Ordering::Relaxed);
-            }
+            c.done_chunks.fetch_add(slice.iter().filter(|(_, _, row_only)| !row_only).count(), Ordering::Relaxed);
             progress.tick(&c, &job.world_id);
+            if c.halted() {
+                outcome_complete = false;
+                break 'regions;
+            }
         }
         if drew {
             c.unsaved.fetch_add(1, Ordering::Relaxed);
@@ -545,7 +621,7 @@ fn hms(ms: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::horizon_squaremap::config::{Config, DEFAULT_TOML};
+    use crate::horizon_squaremap::config::{Config, RenderLimits, DEFAULT_TOML};
     use crate::horizon_squaremap::region::testdata::{chunk, region};
     use crate::horizon_squaremap::region::{Ids, Shape};
     use crate::horizon_squaremap::tables::RawState;
@@ -643,6 +719,8 @@ mod tests {
                 u.fetch_sub(1, Ordering::Relaxed);
             }),
             control: control.clone(),
+            limits: RenderLimits::default().resolve("map.render.full", 2, None),
+            max_unsaved: 4,
         };
         PROGRESS_LOGGING.store(false, Ordering::Relaxed);
         assert!(run(job));
@@ -673,6 +751,8 @@ mod tests {
             live: Box::new(|_, _| {}),
             save: Box::new(|_| {}),
             control,
+            limits: RenderLimits::default().resolve("map.render.full", 1, None),
+            max_unsaved: 4,
         };
         assert!(!run(job));
         let (mode, plan) = read_checkpoint(&dir.join("resume_render.json")).unwrap();

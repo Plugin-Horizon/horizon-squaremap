@@ -147,16 +147,112 @@ impl RegionFile {
     }
 }
 
-/// `RegionFileVersion`: 1 gzip, 2 zlib, 3 none. LZ4 (4) and custom (127) are not read.
+/// `RegionFileVersion`: 1 gzip, 2 zlib, 3 none, 4 LZ4 (lz4-java's block stream). Custom (127) is not read.
 pub fn decompress(kind: u8, data: &[u8]) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
     match kind {
         1 => flate2::read::GzDecoder::new(data).read_to_end(&mut out).map_err(|e| e.to_string())?,
         2 => flate2::read::ZlibDecoder::new(data).read_to_end(&mut out).map_err(|e| e.to_string())?,
         3 => return Ok(data.to_vec()),
+        4 => return lz4_block_stream(data),
         k => return Err(format!("chunk compression {k} is not supported")),
     };
     Ok(out)
+}
+
+/// lz4-java's `LZ4BlockOutputStream` format (what `RegionFileVersion.VERSION_LZ4` writes): blocks of
+/// `LZ4Block`, a token (0x10 stored, 0x20 compressed; the low nibble is the level), the compressed and the original
+/// length and a checksum (all little endian), then the data; a block of length 0 ends the stream.
+pub fn lz4_block_stream(data: &[u8]) -> Result<Vec<u8>, String> {
+    const MAGIC: &[u8; 8] = b"LZ4Block";
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    while at < data.len() {
+        let head = data.get(at..at + 21).ok_or("truncated LZ4 block header")?;
+        if &head[..8] != MAGIC {
+            return Err("bad LZ4 block magic".into());
+        }
+        let method = head[8] & 0xF0;
+        let compressed = u32::from_le_bytes(head[9..13].try_into().unwrap()) as usize;
+        let original = u32::from_le_bytes(head[13..17].try_into().unwrap()) as usize;
+        at += 21;
+        if original == 0 {
+            break;
+        }
+        if original > 1 << 26 {
+            return Err("LZ4 block too large".into());
+        }
+        let body = data.get(at..at + compressed).ok_or("truncated LZ4 block")?;
+        at += compressed;
+        match method {
+            0x10 => {
+                if compressed != original {
+                    return Err("bad stored LZ4 block".into());
+                }
+                out.extend_from_slice(body);
+            }
+            0x20 => lz4_block(body, original, &mut out)?,
+            m => return Err(format!("unknown LZ4 block method {m:#x}")),
+        }
+    }
+    Ok(out)
+}
+
+/// One LZ4 block (`LZ4_decompress_safe`): `original` bytes are appended to `out`.
+fn lz4_block(src: &[u8], original: usize, out: &mut Vec<u8>) -> Result<(), String> {
+    let start = out.len();
+    let end = start + original;
+    let mut i = 0usize;
+    let byte = |i: usize| src.get(i).copied().ok_or_else(|| "truncated LZ4 data".to_string());
+    while i < src.len() {
+        let token = src[i];
+        i += 1;
+        let mut literals = (token >> 4) as usize;
+        if literals == 15 {
+            loop {
+                let b = byte(i)?;
+                i += 1;
+                literals += b as usize;
+                if b != 255 {
+                    break;
+                }
+            }
+        }
+        let lit = src.get(i..i + literals).ok_or("truncated LZ4 literals")?;
+        out.extend_from_slice(lit);
+        i += literals;
+        if out.len() >= end {
+            break; // the last sequence has no match
+        }
+        let offset = u16::from_le_bytes([byte(i)?, byte(i + 1)?]) as usize;
+        i += 2;
+        let mut len = (token & 15) as usize;
+        if len == 15 {
+            loop {
+                let b = byte(i)?;
+                i += 1;
+                len += b as usize;
+                if b != 255 {
+                    break;
+                }
+            }
+        }
+        len += 4;
+        if offset == 0 || offset > out.len() - start {
+            return Err("bad LZ4 match offset".into());
+        }
+        for _ in 0..len {
+            let b = out[out.len() - offset];
+            out.push(b);
+        }
+        if out.len() > end {
+            return Err("LZ4 block overruns its length".into());
+        }
+    }
+    if out.len() != end {
+        return Err("LZ4 block has the wrong length".into());
+    }
+    Ok(())
 }
 
 /// Block state ids by `name[key=value,...]` (keys sorted), and biome ids by name, from
@@ -196,6 +292,14 @@ impl Ids {
     /// A saved palette entry's state id; an unknown block is air ([`u32::MAX`]).
     fn state(&self, entry: &Tag) -> u32 {
         let Some((name, mut props)) = palette_entry(entry) else { return u32::MAX };
+        let key = state_key(&name, &mut props);
+        self.states.get(&key).or_else(|| self.blocks.get(&name)).copied().unwrap_or(u32::MAX)
+    }
+
+    /// The state id of a block state as the host writes it (`minecraft:oak_stairs[facing=north,half=bottom]`); an
+    /// unknown state falls back to its block's first state, an unknown block is air ([`u32::MAX`]).
+    pub fn state_text(&self, text: &str) -> u32 {
+        let (name, mut props) = crate::horizon_squaremap::vanilla::parse_state(text);
         let key = state_key(&name, &mut props);
         self.states.get(&key).or_else(|| self.blocks.get(&name)).copied().unwrap_or(u32::MAX)
     }
@@ -283,6 +387,26 @@ struct Section {
     biomes: Paletted<u16>,
 }
 
+/// A section of a loaded chunk as the engine reports it (the SDK's `SectionData`, without light).
+pub struct LiveSection {
+    /// The section's y (block y `y * 16`).
+    pub y: i32,
+    /// Block states as the host writes them, in order of first use.
+    pub block_palette: Vec<String>,
+    /// 4096 indexes into `block_palette`, `(y << 8) | (z << 4) | x`.
+    pub blocks: Vec<u16>,
+    pub biome_palette: Vec<String>,
+    /// 64 indexes into `biome_palette`, `(y << 4) | (z << 2) | x`.
+    pub biomes: Vec<u8>,
+}
+
+/// Indexes packed `bits` each, none across two longs (the saved layout).
+fn pack_indexes(values: impl Iterator<Item = u64>, bits: u32) -> Vec<i64> {
+    let per = (64 / bits) as usize;
+    let values: Vec<u64> = values.collect();
+    values.chunks(per).map(|c| c.iter().enumerate().fold(0u64, |w, (i, &v)| w | v << (i as u32 * bits)) as i64).collect()
+}
+
 /// One saved chunk, as the scanner reads it.
 #[derive(Debug)]
 pub struct DiskChunk {
@@ -348,6 +472,39 @@ impl DiskChunk {
         Ok(Some(chunk))
     }
 
+    /// A loaded chunk from its sections and its `WORLD_SURFACE` heights (`chunk.heightmap`: the y one above the highest
+    /// block of each column, `z * 16 + x`; a chunk without them gets the heights from the blocks).
+    pub fn from_live(sections: Vec<LiveSection>, heights: Option<&[i16]>, ids: &Ids, shape: Shape) -> Result<DiskChunk, String> {
+        let min_section = shape.min_y >> 4;
+        let count = ((shape.top_y - shape.min_y) >> 4).max(0) as usize;
+        let mut slots: Vec<Option<Section>> = (0..count).map(|_| None).collect();
+        for s in sections {
+            let Some(slot) = usize::try_from(s.y - min_section).ok().filter(|&i| i < count) else { continue };
+            if s.block_palette.is_empty() || s.blocks.len() != 4096 || s.biomes.len() != 64 {
+                continue;
+            }
+            let palette: Vec<u32> = s.block_palette.iter().map(|t| ids.state_text(t)).collect();
+            let bits = ceil_log2(palette.len()).max(4);
+            let data = (palette.len() > 1).then(|| pack_indexes(s.blocks.iter().map(|&v| u64::from(v)), bits));
+            let states = Paletted::new(palette, data.as_deref(), 4096, 4)?;
+            let biome_palette: Vec<u16> = if s.biome_palette.is_empty() {
+                vec![ids.biome("minecraft:plains")]
+            } else {
+                s.biome_palette.iter().map(|n| ids.biome(n)).collect()
+            };
+            let biome_bits = ceil_log2(biome_palette.len()).max(1);
+            let biome_data = (biome_palette.len() > 1).then(|| pack_indexes(s.biomes.iter().map(|&v| u64::from(v)), biome_bits));
+            let biomes = Paletted::new(biome_palette, biome_data.as_deref(), 64, 0)?;
+            slots[slot] = Some(Section { states, biomes });
+        }
+        let mut chunk = DiskChunk { min_section, sections: slots, surface: Vec::new() };
+        chunk.surface = match heights {
+            Some(h) if h.len() == 256 => h.iter().map(|&v| i32::from(v)).collect(),
+            _ => chunk.compute_surface(ids, shape),
+        };
+        Ok(chunk)
+    }
+
     /// The heightmap from the blocks (a chunk saved without one).
     fn compute_surface(&self, ids: &Ids, shape: Shape) -> Vec<i32> {
         let mut out = vec![shape.min_y; 256];
@@ -394,20 +551,33 @@ pub struct DiskCache {
     chunks: HashMap<(i32, i32), (Option<Arc<DiskChunk>>, u64)>,
     files: HashMap<(i32, i32), (Option<RegionFile>, u64)>,
     clock: u64,
+    cap: usize,
     /// Chunks that failed to read, with the reason (logged by the caller).
     pub errors: Vec<((i32, i32), String)>,
 }
 
+/// Decoded chunks a cache keeps (`idle-chunk-cache-size` of a render sets it).
 const CACHED_CHUNKS: usize = 384;
 const CACHED_FILES: usize = 9;
 
 impl DiskCache {
     pub fn new(dir: PathBuf, ids: Arc<Ids>, shape: Shape) -> DiskCache {
-        DiskCache { dir, ids, shape, chunks: HashMap::new(), files: HashMap::new(), clock: 0, errors: Vec::new() }
+        DiskCache { dir, ids, shape, chunks: HashMap::new(), files: HashMap::new(), clock: 0, cap: CACHED_CHUNKS, errors: Vec::new() }
     }
 
     pub fn shape(&self) -> Shape {
         self.shape
+    }
+
+    /// How many decoded chunks the cache keeps (at least a chunk and its eight neighbours).
+    pub fn with_capacity(mut self, chunks: usize) -> DiskCache {
+        self.cap = chunks.max(9);
+        self
+    }
+
+    /// An empty cache on the same folder, for another worker thread.
+    pub fn fork(&self) -> DiskCache {
+        DiskCache::new(self.dir.clone(), self.ids.clone(), self.shape).with_capacity(self.cap)
     }
 
     /// Closes the region files, so their location tables are read again (the server may
@@ -461,7 +631,7 @@ impl DiskCache {
                 None
             }
         };
-        if self.chunks.len() >= CACHED_CHUNKS {
+        if self.chunks.len() >= self.cap {
             if let Some(old) = self.chunks.iter().min_by_key(|(_, (_, t))| *t).map(|(k, _)| *k) {
                 self.chunks.remove(&old);
             }
@@ -506,6 +676,13 @@ impl DiskView {
     }
 }
 
+impl DiskView {
+    /// A chunk and its eight neighbours (row by row from the north-west), the centre first among them being index 4.
+    pub fn new(cx: i32, cz: i32, chunks: [Option<Arc<DiskChunk>>; 9], shape: Shape, env: Arc<WorldEnv>) -> DiskView {
+        DiskView { cx, cz, chunks, shape, env }
+    }
+}
+
 impl ChunkView for DiskView {
     fn chunk(&self) -> (i32, i32) {
         (self.cx, self.cz)
@@ -540,6 +717,50 @@ impl ChunkView for DiskView {
 }
 
 /// Writers for tests: a chunk's NBT and a region file holding chunks.
+#[cfg(test)]
+mod lz4_tests {
+    use super::*;
+
+    fn block(method: u8, compressed: &[u8], original: usize) -> Vec<u8> {
+        let mut b = b"LZ4Block".to_vec();
+        b.push(method);
+        b.extend((compressed.len() as u32).to_le_bytes());
+        b.extend((original as u32).to_le_bytes());
+        b.extend(0u32.to_le_bytes()); // checksum, not checked
+        b.extend(compressed);
+        b
+    }
+
+    fn end() -> Vec<u8> {
+        block(0x10, &[], 0)
+    }
+
+    #[test]
+    fn lz4_stream_reads_stored_and_compressed_blocks() {
+        // "abcabcabcabcXY": literals "abc", a match (offset 3, 9 more bytes), then literals "XY".
+        let sequence1 = [0x35u8, b'a', b'b', b'c', 3, 0]; // 3 literals, match length 5 + 4 = 9
+        let sequence2 = [0x20u8, b'X', b'Y']; // last: 2 literals
+        let mut compressed = sequence1.to_vec();
+        compressed.extend(sequence2);
+        let mut stream = block(0x20, &compressed, 14);
+        stream.extend(block(0x10, b"!!", 2));
+        stream.extend(end());
+        assert_eq!(lz4_block_stream(&stream).unwrap(), b"abcabcabcabcXY!!");
+        assert_eq!(decompress(4, &stream).unwrap(), b"abcabcabcabcXY!!");
+    }
+
+    #[test]
+    fn lz4_long_runs_use_length_extension_bytes() {
+        // 20 literals: token 0xF0, extension 5; then end.
+        let mut compressed = vec![0xF0, 5];
+        compressed.extend(std::iter::repeat(7u8).take(20));
+        let mut stream = block(0x20, &compressed, 20);
+        stream.extend(end());
+        assert_eq!(lz4_block_stream(&stream).unwrap(), vec![7u8; 20]);
+        assert!(lz4_block_stream(b"LZ4Blocx").is_err());
+    }
+}
+
 #[cfg(test)]
 pub mod testdata {
     use crate::horizon_squaremap::nbt::write::{compound, root};
@@ -651,6 +872,35 @@ mod tests {
     }
 
     const OVERWORLD: Shape = Shape { min_y: -64, top_y: 320, ceiling: false };
+
+    #[test]
+    fn a_loaded_chunk_reads_like_a_saved_one() {
+        // Section 0 (y 0..15): stone below y 8, a log with axis y at (1, 9, 2), air elsewhere; two biomes.
+        let blocks: Vec<u16> = (0..4096)
+            .map(|i| {
+                let (x, y, z) = (i & 15, i >> 8, (i >> 4) & 15);
+                if (x, y, z) == (1, 9, 2) { 2 } else if y < 8 { 1 } else { 0 }
+            })
+            .collect();
+        let section = LiveSection {
+            y: 0,
+            block_palette: vec!["minecraft:air".into(), "minecraft:stone".into(), "minecraft:oak_log[axis=y]".into()],
+            blocks,
+            biome_palette: vec!["minecraft:plains".into(), "minecraft:desert".into()],
+            biomes: (0..64).map(|i| u8::from(i % 4 == 3)).collect(),
+        };
+        let mut heights = vec![8i16; 256];
+        heights[(2 * 16 + 1) as usize] = 10;
+        let c = DiskChunk::from_live(vec![section], Some(&heights), &ids(), OVERWORLD).unwrap();
+        assert_eq!((c.state(0, 7, 0), c.state(0, 8, 0), c.state(1, 9, 2)), (1, 0, 3));
+        assert_eq!((c.surface(1, 2), c.surface(0, 0)), (10, 8));
+        assert_eq!((c.biome(0, 0, 0), c.biome(3, 0, 0)), (Some(0), Some(1)));
+        // A column with no height gets it from the blocks.
+        let section = LiveSection { y: 0, block_palette: vec!["minecraft:stone".into()], blocks: vec![0; 4096], biome_palette: vec![], biomes: vec![0; 64] };
+        let c = DiskChunk::from_live(vec![section], None, &ids(), OVERWORLD).unwrap();
+        assert_eq!((c.state(5, 15, 5), c.surface(5, 5), c.biome(0, 0, 0)), (1, 16, Some(0)));
+    }
+
 
     #[test]
     fn decodes_palette_properties_biomes_and_computed_heights() {

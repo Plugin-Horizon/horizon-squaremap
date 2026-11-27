@@ -1,5 +1,9 @@
 # hmod port: squaremap
 Parity: ~80% now / ~80% with our PRs (120/150 items; before round 5 ~79%, 118/150; method: audit counts of commands, nodes, config keys, message keys and behaviours, estimated, blocked-by-API items count as not done; the start was ~60%)
+Round 3 (2026-11-25, engine families, blind, no compile)
+- Fixed: live redraw. A changed loaded chunk is drawn from a snapshot taken in `level_tick_pre` (the level in place): `ChunkRef::sections` and `chunk.heightmap(WorldSurface)` of the chunk and its eight neighbours become a `DiskChunk` (`DiskChunk::from_live`, new `LiveSection`, `Ids::state_text`) and a `DiskView`, submitted as `Work::Chunk` (the path that existed, nobody fed). The decoded chunks are cached for the tick. The `world_saved` wait stays as the fallback when no snapshot can be taken.
+- Fixed: freshness. An unloaded changed chunk is drawn from the region files only once `level.saved_chunk_modified` is not older than the first change of that chunk (`runtime::changed_second`, `redirty`); an older save is tried again at the next interval, so a write waiting for the region writer is never drawn from the old data.
+- Tests: `region::tests::a_loaded_chunk_reads_like_a_saved_one` (literal states, heights, biomes).
 Round 5 (100 % brief, blind, no compile; hmod-format branch)
 - Fixed: every level, not only the three vanilla dimensions. The fixed `DIMENSIONS`, `WORLDS` and `SHAPES` tables are gone. `src/horizon_squaremap/runtime.rs` keeps a level registry (`LEVELS`, `set_open_levels`, `world_index`, `open_world_index`, `open_levels`, `world_name`, `level_ids`, `world_enabled`, `level_shape`): a level gets an index the first time it is seen and keeps it for the process, with its open flag and the height range the host gave it. `src/lib.rs` `sync_levels` feeds it from `host.levels().list_levels()` at `server_started`, `level_load` and `level_unload` (the event's level added or removed), reads `LevelRef.height` for each open level, and resumes the renders a stop interrupted (`resume_renders`). A level that closes keeps its index, queued work and render job, as the original keeps its region files.
 - Fixed: per-world settings for any level. `config.world(id)` already merged `world-settings.default` with `world-settings."<id>"` (the original's per-key fallback); the runtime now builds a worker per registered level, and `json::settings` lists the open levels whose `map.enabled` is on, with `type` `normal`/`nether`/`the_end`, or `custom` for any other (`WebSettingsPublisher.environment`).
@@ -38,14 +42,12 @@ Round 1
   - `src/lib.rs` `NODES` + `node(name)` helper: typed Boolean nodes for every node the map checks.
   - `src/lib.rs` `permission_gather_nodes` (new hook): declares the 13 nodes at Level 2 (`commands::OP_LEVEL`).
   - `src/lib.rs` `register_commands` / `player_command` / `run_mod_command`: `permission_node(...)` (still a string in the core) is converted to a typed node at the call site; `has_permission` replaced by `permission_bool(...).unwrap_or(false)`, for the subcommand node and both `.others` nodes.
-  - `src/lib.rs` `publish_players`: `nickname` has no Horizon main counterpart; `display_name: None` with a `HMOD-GAP` comment.
+  - `src/lib.rs` `publish_players`: `display_name` is the nickname (`player_nickname`), round 2.
   - Imports added for the permission types.
   - `src/horizon_squaremap/commands.rs` is unchanged: its string-returning helpers and their tests stay as they were.
 - Permission nodes: `squaremap.command.{help,cancelrender,fullrender,pauserender,radiusrender,resetmap,progresslogging,hide,show,reload,link}` and `squaremap.command.hide.others`, `squaremap.command.show.others` -> Level 1 (any operator, as Bukkit's default for an unregistered node; Level 2 in round 1), declared in `src/lib.rs` `permission_gather_nodes` from `NODES`.
 - Gaps:
-  - HMOD-GAP(nickname): Horizon main has `set_nickname` but no getter. The map's `display_name` is always the real name.
-  - HMOD-GAP(chunk_snapshot): no chunk snapshot API; changed loaded chunks are not redrawn in the background.
-  - HMOD-GAP(item_in_tag): no item tag query; the `map-invisibility-equipment` rule uses the vanilla tag's entry (carved pumpkin).
+  - HMOD-GAP(chunk_snapshot): no chunk snapshot API in the combined SDK (`chunk_sections` is only on `rec-world-data`, without heightmaps); changed loaded chunks are redrawn after the next save.
 - Unsure:
   - `NODES` is a fixed list, not derived from `commands::usages()`, because `usages()` reads the runtime config (not loaded at gather time). If the label or the command set changes, `NODES` must follow.
   - The `.others` nodes had no declared default before. I chose Level 2 to match the subcommand nodes.

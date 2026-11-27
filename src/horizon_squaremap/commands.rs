@@ -59,7 +59,6 @@ pub fn usages() -> Vec<(String, u8)> {
     labels.extend(c.main_command_aliases.iter().filter(|a| **a != c.main_command_label).cloned());
     let mut out = Vec::new();
     for l in labels.iter().filter(|l| !l.is_empty() && !l.contains(char::is_whitespace)) {
-        out.push((l.clone(), 0));
         out.push((format!("{l} confirm"), 0));
         // World names are `minecraft:<name>` keys, which a `word` argument refuses (no colon); a world that
         // comes last is `text` instead. `radiusrender` has the world first, so it stays `word?` (`overworld`, `the_nether`).
@@ -163,7 +162,12 @@ pub struct Line {
 impl Line {
     /// The text without colours, hovers and clicks.
     pub fn text(&self) -> String {
-        self.parts.iter().map(|p| p.text.as_str()).collect()
+        self.expanded().iter().map(|p| p.text.as_str()).collect()
+    }
+
+    /// The parts with the language file's MiniMessage tags turned into colours, clicks and hovers.
+    pub fn expanded(&self) -> Vec<Part> {
+        self.parts.iter().flat_map(crate::horizon_squaremap::mini::expand).collect()
     }
 }
 
@@ -185,8 +189,8 @@ fn clickable(mut p: Part, hover: impl Into<String>, click: Click) -> Part {
 static LANG: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
 
 /// Reads a language file (squaremap's `locale/lang-en.yml` form). Keys it lacks keep the English text. A message
-/// is MiniMessage there; its colour and click tags are not followed, only its words and placeholders (the colours of
-/// each message stay squaremap's defaults). A file that cannot be read leaves the previous language.
+/// is MiniMessage there: its colour, click and hover tags are followed (`mini`), the message keeping squaremap's colour
+/// where the file sets none. A file that cannot be read leaves the previous language.
 pub fn set_language(text: &str) -> Result<(), String> {
     let table = crate::horizon_squaremap::yaml::parse(text)?;
     *LANG.lock().unwrap() = Some(crate::horizon_squaremap::yaml::flatten(&table));
@@ -198,14 +202,17 @@ pub fn clear_language() {
     *LANG.lock().unwrap() = None;
 }
 
-/// A message by its key in the language file: the file's text, else `default`, with `<name>` placeholders from
-/// `vars` filled in and every other MiniMessage tag dropped.
+/// A message by its key in the language file: the file's text (behind `mini::MARK`, its tags still in it, for
+/// `Line::expanded`), else `default`, with `<name>` placeholders from `vars` filled in and every other tag dropped.
 fn tr(key: &str, default: &str, vars: &[(&str, &str)]) -> String {
     tr_from(LANG.lock().unwrap().as_ref(), key, default, vars)
 }
 
 fn tr_from(lang: Option<&HashMap<String, String>>, key: &str, default: &str, vars: &[(&str, &str)]) -> String {
-    fill(lang.and_then(|m| m.get(key)).map_or(default, String::as_str), vars)
+    match lang.and_then(|m| m.get(key)) {
+        Some(text) => format!("{}{}", crate::horizon_squaremap::mini::MARK, crate::horizon_squaremap::mini::fill_rich(text, vars)),
+        None => fill(default, vars),
+    }
 }
 
 fn fill(template: &str, vars: &[(&str, &str)]) -> String {
@@ -281,6 +288,18 @@ fn highlight_special(text: &str, color: u32) -> Vec<Part> {
 
 /// The subcommands of the bare label, as cloud lists them when the label alone is typed.
 const ROOT_SYNTAX: &str = "<cancelrender|confirm|fullrender|help|hide|link|pauserender|progresslogging|radiusrender|reload|resetmap|show>";
+
+/// The permission node that shows the failure's detail (ExceptionHandler.commandExecution).
+pub const STACKTRACE_NODE: &str = "squaremap.command-exception-stacktrace";
+
+/// squaremap's `command.message.exception.command-execution`: an unexpected failure while a command ran. `detail` is
+/// put on hover for senders holding `squaremap.command-exception-stacktrace`.
+pub fn command_failed(detail: Option<&str>) -> Line {
+    let text = tr("command.message.exception.command-execution", "An internal error occurred while attempting to perform this command.", &[]);
+    let mut p = colored(text, RED);
+    p.hover = detail.map(str::to_string);
+    error(vec![p])
+}
 
 /// squaremap's `command.message.exception.no-permission`, as the player sees it.
 pub fn no_permission() -> Line {
@@ -911,6 +930,29 @@ pub fn world_completions(command: &str) -> Vec<String> {
     out
 }
 
+/// The completions of the other arguments: `help <query>` lists every command's syntax (`squaremap <syntax>`, cloud's
+/// help-query suggestions) and `progresslogging rate` the numbers 1 to 9 (cloud's integer suggestions).
+pub fn other_completions(command: &str) -> Vec<String> {
+    let words: Vec<&str> = command.split(' ').collect();
+    if !is_ours(command) {
+        return Vec::new();
+    }
+    let sub = words.get(1).map(|w| w.to_ascii_lowercase()).unwrap_or_default();
+    match (words.len(), sub.as_str()) {
+        (3, "help") => {
+            let typed = words[2].to_ascii_lowercase();
+            HELP.iter()
+                .map(|e| format!("squaremap {}", e.syntax))
+                .filter(|s| s.to_ascii_lowercase().starts_with(&typed))
+                .collect()
+        }
+        (4, "progresslogging") if words[2].eq_ignore_ascii_case("rate") => {
+            (1..=9).map(|n| n.to_string()).filter(|n| n.starts_with(words[3])).collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
 /// A one-line status of each level's render, for operators (`/squaremap` has no status
 /// command; used by the game side's log if wanted).
 pub fn status_lines() -> Vec<String> {
@@ -927,6 +969,30 @@ pub fn status_lines() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn help_and_the_progress_rate_complete_as_paper_does() {
+        let help = other_completions("map help ");
+        assert_eq!(help.len(), 16);
+        assert_eq!(help[0], "squaremap cancelrender [world]");
+        assert!(help.contains(&"squaremap progresslogging rate <seconds>".to_owned()));
+        assert!(help.iter().any(|h| h.starts_with("squaremap radiusrender")));
+        assert_eq!(other_completions("squaremap help sho"), Vec::<String>::new());
+        assert_eq!(other_completions("squaremap help sq").len(), 16);
+        assert_eq!(other_completions("map progresslogging rate "), ["1", "2", "3", "4", "5", "6", "7", "8", "9"]);
+        assert!(other_completions("map progresslogging toggle ").is_empty());
+        assert!(other_completions("tp help ").is_empty());
+    }
+
+    #[test]
+    fn command_failed_hover_only_with_detail() {
+        let plain = command_failed(None);
+        assert!(plain.parts[0].hover.is_none());
+        assert!(plain.prefixed);
+        let with = command_failed(Some("boom"));
+        assert_eq!(with.parts[0].hover.as_deref(), Some("boom"));
+        assert_eq!(STACKTRACE_NODE, "squaremap.command-exception-stacktrace");
+    }
+
     use super::*;
 
     fn texts(lines: &[Line]) -> Vec<String> {
@@ -948,7 +1014,9 @@ mod tests {
     #[test]
     fn usages_cover_label_and_alias() {
         let u = usages();
-        assert!(u.contains(&("squaremap".into(), 0)));
+        // The label alone has no handler on Paper: Brigadier answers unknown/incomplete command, so no bare usage is registered.
+        assert!(!u.iter().any(|(usage, _)| usage == "squaremap" || usage == "map"), "{u:?}");
+        assert!(u.contains(&("squaremap confirm".into(), 0)));
         assert!(u.contains(&("map confirm".into(), 0)));
         assert!(u.contains(&("map fullrender [world:text]".into(), OP_LEVEL)));
         assert!(is_ours("map hide") && is_ours("/SquareMap") && !is_ours("maps"));
@@ -1070,8 +1138,14 @@ mod tests {
         assert_eq!(fill("a < b", &[]), "a < b");
         let file = "render-not-in-progress: '<red>Kein Render fuer <world>'\ncommand:\n  message:\n    no-pending-commands: Nichts ausstehend\n";
         let lang = crate::horizon_squaremap::yaml::flatten(&crate::horizon_squaremap::yaml::parse(file).unwrap());
-        assert_eq!(tr_from(Some(&lang), "render-not-in-progress", "No renders running for <world>", &[("world", "x")]), "Kein Render fuer x");
-        assert_eq!(tr_from(Some(&lang), "command.message.no-pending-commands", "You don't have any pending commands.", &[]), "Nichts ausstehend");
+        assert_eq!(tr_from(Some(&lang), "render-not-in-progress", "No renders running for <world>", &[("world", "x")]), "\u{1}<red>Kein Render fuer x");
+        assert_eq!(tr_from(Some(&lang), "command.message.no-pending-commands", "You don't have any pending commands.", &[]), "\u{1}Nichts ausstehend");
+        // The line the player gets: the file's colour wins over the command's default, the tags are gone.
+        let line = msg(tr_from(Some(&lang), "render-not-in-progress", "No renders running for <world>", &[("world", "a<b")]), GREEN);
+        assert_eq!(line.text(), "Kein Render fuer a<b");
+        assert_eq!(line.expanded()[0].color, Some(RED));
+        let plain_line = msg(tr_from(Some(&lang), "command.message.no-pending-commands", "x", &[]), GREEN);
+        assert_eq!(plain_line.expanded()[0].color, Some(GREEN));
         // A key the file lacks keeps the English text.
         assert_eq!(tr_from(Some(&lang), "cancelled-render", "Render cancelled for <world>", &[("world", "x")]), "Render cancelled for x");
         assert_eq!(tr_from(None, "cancelled-render", "Render cancelled for <world>", &[("world", "y")]), "Render cancelled for y");

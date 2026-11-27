@@ -34,6 +34,9 @@ static RUNTIME: Mutex<Option<Runtime>> = Mutex::new(None);
 static EARLY: Mutex<Vec<(usize, i32, i32)>> = Mutex::new(Vec::new());
 /// Chunks loaded now, per level: a render job draws these from memory.
 static LOADED: Mutex<Option<HashSet<(usize, i32, i32)>>> = Mutex::new(None);
+/// When each changed chunk first changed since it was last drawn, in unix seconds: an unloaded chunk is drawn from
+/// the region files only once its save is at least this new (`LevelRef::saved_chunk_modified`).
+static CHANGED: Mutex<Option<HashMap<(usize, i32, i32), i64>>> = Mutex::new(None);
 /// Loaded chunks a render job handed over, drawn with the next batch.
 static HANDOFF: Mutex<Vec<(usize, i32, i32)>> = Mutex::new(Vec::new());
 /// Every level the map has seen, in the order it first saw them. An index is kept for the life of the process
@@ -108,6 +111,7 @@ struct Runtime {
     in_flight: Arc<AtomicUsize>,
     json: Arc<JsonStore>,
     server: Option<WebServer>,
+    flush_json_immediately: bool,
     next_players: Instant,
     players: String,
 }
@@ -246,6 +250,16 @@ pub fn level_shape(world: usize, min_y: i32, top_y: i32, ceiling: bool) {
     }
 }
 
+/// The tables a snapshot of a loaded chunk is decoded with, and the biome zoom and swamp noise it is drawn with.
+pub fn snapshot_tables() -> Option<(Arc<Ids>, Arc<WorldEnv>)> {
+    with(|rt| (rt.ids.clone(), rt.env.clone()))
+}
+
+/// The height range and ceiling of level `world`.
+pub fn level_shape_of(world: usize) -> Shape {
+    shape(world)
+}
+
 fn shape(world: usize) -> Shape {
     match LEVELS.lock().unwrap().get(world) {
         Some(l) => l.shape.unwrap_or_else(|| Shape::vanilla(&l.id)),
@@ -264,6 +278,13 @@ pub fn resume_renders() {
     with(|rt| rt.resume_jobs());
 }
 
+/// `settings.web-directory.path`: absolute as given, else under the plugin's data folder (`plugins/squaremap/web`,
+/// where the original keeps the frontend and the tiles).
+pub fn web_directory(path: &str) -> PathBuf {
+    let path = Path::new(path);
+    if path.is_absolute() { path.to_path_buf() } else { Path::new("plugins/squaremap").join(path) }
+}
+
 /// Opens the map for a world folder with the game's block states and biomes, and what the
 /// game knows of biomes beyond the saved data (`env`). Resumes renders a stop interrupted.
 pub fn start(world_dir: &Path, states: Vec<RawState>, biomes: Vec<RawBiome>, env: WorldEnv) -> Result<(), String> {
@@ -276,8 +297,7 @@ fn start_with(args: StartArgs) -> Result<(), String> {
     stop();
     let StartArgs { dir: world_dir, states, biomes, env } = args;
     let config = config();
-    let web_path = Path::new(&config.settings.web_directory.path);
-    let web = if web_path.is_absolute() { web_path.to_path_buf() } else { world_dir.join(web_path) };
+    let web = web_directory(&config.settings.web_directory.path);
     if config.settings.web_directory.auto_update {
         write_frontend(&web).map_err(|e| format!("writing the web folder {}: {e}", web.display()))?;
     }
@@ -306,6 +326,7 @@ fn start_with(args: StartArgs) -> Result<(), String> {
     let data = world_dir.join("squaremap").join("data");
     crate::horizon_squaremap::api::load_hidden(data.join("hidden-players.json"));
     let now = Instant::now();
+    let flush_json_immediately = config.settings.internal_webserver.flush_json_immediately;
     let mut rt = Runtime {
         web,
         dir: world_dir,
@@ -319,6 +340,7 @@ fn start_with(args: StartArgs) -> Result<(), String> {
         in_flight,
         json,
         server,
+        flush_json_immediately,
         next_players: now,
         players: String::new(),
     };
@@ -406,6 +428,15 @@ pub fn is_loaded(world: usize, cx: i32, cz: i32) -> bool {
 
 /// A block of level `world` changed.
 pub fn block_changed(world: usize, x: i32, z: i32) {
+    {
+        let mut changed = CHANGED.lock().unwrap();
+        let map = changed.get_or_insert_with(HashMap::new);
+        if map.len() >= 200_000 {
+            map.clear();
+        }
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+        map.entry((world, x >> 4, z >> 4)).or_insert(now);
+    }
     with(|rt| {
         if let Some(w) = rt.worlds.get_mut(world).filter(|w| w.config.map.enabled) {
             w.dirty.insert((x >> 4, z >> 4));
@@ -456,6 +487,27 @@ pub fn due_chunks(world: usize) -> Vec<(i32, i32)> {
         w.ready.drain(..n).collect()
     })
     .unwrap_or_default()
+}
+
+/// The second a chunk first changed since it was last drawn (0 when unknown).
+pub fn changed_second(world: usize, cx: i32, cz: i32) -> i64 {
+    CHANGED.lock().unwrap().as_ref().and_then(|m| m.get(&(world, cx, cz)).copied()).unwrap_or(0)
+}
+
+/// The chunk was drawn: its change is no longer pending.
+pub fn drawn(world: usize, cx: i32, cz: i32) {
+    if let Some(m) = CHANGED.lock().unwrap().as_mut() {
+        m.remove(&(world, cx, cz));
+    }
+}
+
+/// A due chunk whose save is older than its change is tried again at the next interval.
+pub fn redirty(world: usize, cx: i32, cz: i32) {
+    with(|rt| {
+        if let Some(w) = rt.worlds.get_mut(world) {
+            w.dirty.insert((cx, cz));
+        }
+    });
 }
 
 /// A due chunk. One that is still loaded has its new blocks in memory only: it waits for the next world save and is
@@ -626,6 +678,10 @@ pub fn publish_markers(world: usize, spawn: Option<[i32; 2]>, border: [f64; 4]) 
         let settings = json::world_settings(&w.config, spawn.unwrap_or_default()).to_string();
         let mut layers = json::markers(&w.config, spawn, border, now_millis());
         if let serde_json::Value::Array(list) = &mut layers {
+            // ChunkyBorder's layer takes the place of squaremap's own border while it exists.
+            if crate::horizon_squaremap::api::has_layer(&w.id, "chunky") {
+                list.retain(|l| l["id"] != "squaremap-worldborder");
+            }
             list.extend(crate::horizon_squaremap::api::layers_json(&w.id));
         }
         rt.put(&format!("/tiles/{name}/settings.json"), settings);
@@ -740,8 +796,24 @@ pub fn render_status(world: usize) -> Option<(Mode, usize, usize, bool)> {
     .flatten()
 }
 
-/// `progresslogging toggle|rate`: the running jobs log their next line now.
+/// Writes one setting back to the config files (`settings.render-progress-logging.enabled`, ...): the glue sets it.
+static PERSIST: Mutex<Option<fn(&[&str], &str)>> = Mutex::new(None);
+
+/// Registers the function that writes a setting (key path, value text) into the server's config files.
+pub fn set_persist(f: fn(&[&str], &str)) {
+    *PERSIST.lock().unwrap() = Some(f);
+}
+
+/// Saves `settings.render-progress-logging` as `progresslogging toggle|rate` changed it.
+fn persist_progress_logging() {
+    let Some(f) = *PERSIST.lock().unwrap() else { return };
+    f(&["settings", "render-progress-logging", "enabled"], &render::PROGRESS_LOGGING.load(Ordering::Relaxed).to_string());
+    f(&["settings", "render-progress-logging", "interval-seconds"], &render::PROGRESS_INTERVAL.load(Ordering::Relaxed).to_string());
+}
+
+/// `progresslogging toggle|rate`: the setting is saved and the running jobs log their next line now.
 pub fn restart_progress_logging() {
+    persist_progress_logging();
     with(|rt| {
         for j in rt.worlds.iter().filter_map(|w| w.job.as_ref()) {
             j.control.log_now.store(true, Ordering::Relaxed);
@@ -802,9 +874,9 @@ fn write_icon_into(web: &Path, key: &str, png: &[u8]) {
 
 impl Runtime {
     fn put(&self, path: &str, doc: String) {
-        self.json.put(path, doc);
-        if self.server.is_none() {
-            let _ = self.json.flush(&self.web);
+        // Written at once with `flush-json-immediately` or with the web server off (`WebJsonStore.put`).
+        if self.json.put(path, doc) && (self.flush_json_immediately || self.server.is_none()) {
+            let _ = self.json.flush_one(&self.web, path);
         }
     }
 
@@ -899,7 +971,11 @@ impl Runtime {
     fn spawn_job(&mut self, world: usize, mode: Mode, plan: Box<dyn FnOnce(()) -> Plan + Send>) {
         let checkpoint = self.checkpoint(world);
         let id = self.worlds[world].id.clone();
-        let cache = DiskCache::new(region_dir(&self.dir, &id), self.ids.clone(), shape(world));
+        let w = &self.worlds[world];
+        let limits = if mode == Mode::Full { w.config.map.full_limits() } else { w.config.map.radius_limits() };
+        let max_unsaved = w.config.map.image_saving.resolve().1;
+        let cache = DiskCache::new(region_dir(&self.dir, &id), self.ids.clone(), shape(world))
+            .with_capacity(limits.idle_chunk_cache_size);
         let (env, sender) = (self.env.clone(), self.jobs.clone());
         let w = &mut self.worlds[world];
         if let Some(t) = w.job.take().and_then(|mut j| j.thread.take()) {
@@ -930,6 +1006,8 @@ impl Runtime {
                     }
                 }),
                 control: c.clone(),
+                limits,
+                max_unsaved,
             };
             let complete = render::run(job);
             if complete {
@@ -1099,6 +1177,13 @@ mod tests {
 
     fn open_ids() -> Vec<String> {
         open_levels().into_iter().map(|(_, id)| id).collect()
+    }
+
+    #[test]
+    fn the_web_folder_is_under_the_plugins_data_folder() {
+        assert_eq!(web_directory("web"), Path::new("plugins/squaremap/web"));
+        assert_eq!(web_directory("/srv/map"), Path::new("/srv/map"));
+        assert_eq!(crate::horizon_squaremap::config::Settings::default().web_directory.path, "web");
     }
 
     #[test]

@@ -242,6 +242,11 @@ pub(crate) fn generation() -> u64 {
     with(|a| a.generation)
 }
 
+/// Whether a layer is registered in a world.
+pub fn has_layer(world: &str, key: &str) -> bool {
+    with(|a| a.layers.iter().any(|((w, k), _)| w == world && k == key))
+}
+
 /// The world's API layers as `markers.json` entries (`MarkerDataPublisher`).
 pub(crate) fn layers_json(world: &str) -> Vec<Value> {
     with(|a| {
